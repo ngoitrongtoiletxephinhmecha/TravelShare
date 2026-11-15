@@ -1,4 +1,4 @@
-import { ForbiddenException, HttpException } from '@nestjs/common';
+import { ConflictException, ForbiddenException, HttpException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Types } from 'mongoose';
 import { AiService } from './ai.service';
@@ -53,7 +53,7 @@ describe('AiService, TripRequirementParser & TripStateValidator Suite (Phase 6)'
     configService = {
       get: jest.fn().mockImplementation((key: string) => {
         if (key === 'gemini.apiKey') return '';
-        if (key === 'gemini.model') return 'gemini-2.5-flash';
+        if (key === 'gemini.model') return 'gemini-4-hydrogen';
         if (key === 'gemini.timeoutMs') return 5000;
         return undefined;
       }),
@@ -88,11 +88,18 @@ describe('AiService, TripRequirementParser & TripStateValidator Suite (Phase 6)'
       }),
       findOneAndUpdate: jest.fn().mockImplementation((filter: any, update: any) => {
         const existing = aiConversationsStore.get(String(filter._id));
-        if (existing && update.$set) {
+        if (
+          !existing ||
+          (filter.stateVersion !== undefined &&
+            existing.stateVersion !== filter.stateVersion)
+        ) {
+          return makeChainable(null);
+        }
+        if (update.$set) {
           Object.assign(existing, update.$set, { updatedAt: new Date() });
           aiConversationsStore.set(String(existing._id), existing);
         }
-        return makeChainable(existing || null);
+        return makeChainable(existing);
       }),
     };
 
@@ -148,9 +155,18 @@ describe('AiService, TripRequirementParser & TripStateValidator Suite (Phase 6)'
         });
         return makeChainable(list);
       }),
+      deleteOne: jest.fn().mockImplementation((filter: any) => {
+        if (filter?._id) {
+          aiMessagesStore.delete(String(filter._id));
+        }
+        return Promise.resolve({ deletedCount: 1 });
+      }),
     };
 
     const mockTravelPlanModel: any = {
+      findById: jest.fn().mockImplementation((id: any) => {
+        return makeChainable(travelPlansStore.get(String(id)) || null);
+      }),
       create: jest.fn().mockImplementation((payload: any) => {
         const id = new Types.ObjectId();
         const doc = {
@@ -171,6 +187,12 @@ describe('AiService, TripRequirementParser & TripStateValidator Suite (Phase 6)'
         }
         return makeChainable(existing || null);
       }),
+      deleteOne: jest.fn().mockImplementation((filter: any) => {
+        if (filter?._id) {
+          travelPlansStore.delete(String(filter._id));
+        }
+        return Promise.resolve({ deletedCount: 1 });
+      }),
     };
 
     const mockChecklistModel: any = {
@@ -187,7 +209,20 @@ describe('AiService, TripRequirementParser & TripStateValidator Suite (Phase 6)'
         return Promise.resolve(doc);
       }),
       findById: jest.fn().mockImplementation((id: any) => {
-        return makeChainable(checklistsStore.get(String(id)) || null);
+        const doc = checklistsStore.get(String(id));
+        if (!doc) return makeChainable(null);
+        return makeChainable({
+          ...doc,
+          items: Array.isArray(doc.items)
+            ? doc.items.map((it: any) => ({ ...it }))
+            : [],
+          removedItemCodes: Array.isArray(doc.removedItemCodes)
+            ? [...doc.removedItemCodes]
+            : [],
+          versionHistory: Array.isArray(doc.versionHistory)
+            ? doc.versionHistory.map((h: any) => ({ ...h }))
+            : [],
+        });
       }),
       findByIdAndUpdate: jest.fn().mockImplementation((id: any, update: any) => {
         const existing = checklistsStore.get(String(id));
@@ -196,6 +231,12 @@ describe('AiService, TripRequirementParser & TripStateValidator Suite (Phase 6)'
           checklistsStore.set(String(id), existing);
         }
         return makeChainable(existing || null);
+      }),
+      deleteOne: jest.fn().mockImplementation((filter: any) => {
+        if (filter?._id) {
+          checklistsStore.delete(String(filter._id));
+        }
+        return Promise.resolve({ deletedCount: 1 });
       }),
     };
 
@@ -647,5 +688,470 @@ describe('AiService, TripRequirementParser & TripStateValidator Suite (Phase 6)'
       quantityMissing: 1,
     });
     expect(getEntry(reloaded.checklistPreview, 'CAMPING_CHAIR')).toBeUndefined();
+  });
+
+  // =========================================================================
+  // 9. PHASE 9A: BA VÌ FLOW — DESTINATION QA, CHECKLIST READS, COMBINED TURNS & PRINT RULE
+  // =========================================================================
+  it('handles Phase 9A Ba Vì flow: Destination QA ("ở đó") & Checklist read queries preserve checklistVersion, combined turns work, and full checklist only prints when created or requested', async () => {
+    const conv = await aiService.createConversation(user1Id, {});
+
+    // Turn 1: Set up Ba Vì camping 2 days, 4 travelers -> generates checklist v1 & prints initial preview
+    const turn1 = await aiService.sendMessage(conv.id, user1Id, {
+      content: 'Tôi muốn cắm trại ở Ba Vì 2 ngày, nhóm 4 người',
+      clientMessageId: 'bavi-9a-1',
+    });
+    expect(turn1.status).toBe('READY_FOR_CHECKLIST');
+    expect(turn1.tripState.destination).toBe('Vườn Quốc gia Ba Vì');
+    expect(turn1.reply).toContain('Checklist hiện tại');
+
+    const checklistId = String(turn1.conversation.checklistId);
+    expect(checklistsStore.get(checklistId)?.checklistVersion).toBe(1);
+
+    // Turn 2: Pure DESTINATION_QA ("Giới thiệu ngắn gọn về Ba Vì") -> answers QA, does NOT bump checklistVersion, does NOT print full checklist
+    const turn2Qa = await aiService.sendMessage(conv.id, user1Id, {
+      content: 'Giới thiệu ngắn gọn về Ba Vì',
+      clientMessageId: 'bavi-9a-2-qa',
+    });
+    expect(turn2Qa.tripState.destination).toBe('Vườn Quốc gia Ba Vì');
+    expect(turn2Qa.reply).toContain('Ba Vì');
+    expect(turn2Qa.reply).not.toContain('Checklist hiện tại');
+    expect(checklistsStore.get(checklistId)?.checklistVersion).toBe(1);
+
+    // Turn 3: Follow-up coreference QA ("Ở đó có gì nổi bật?") -> uses saved destination Ba Vì, keeps checklistVersion = 1
+    const turn3Coref = await aiService.sendMessage(conv.id, user1Id, {
+      content: 'Ở đó có gì nổi bật?',
+      clientMessageId: 'bavi-9a-3-coref',
+    });
+    expect(turn3Coref.reply).toMatch(/Đỉnh Vua|Nhà thờ cổ|rừng thông/i);
+    expect(turn3Coref.tripState.destination).toBe('Vườn Quốc gia Ba Vì');
+    expect(checklistsStore.get(checklistId)?.checklistVersion).toBe(1);
+
+    // Turn 4: "Nhóm đã có 1 lều" -> updates TENT 2/1/1, bumps checklistVersion to 2, concise confirmation only (no full checklist dump)
+    const turn4Tent = await aiService.sendMessage(conv.id, user1Id, {
+      content: 'Nhóm đã có 1 lều',
+      clientMessageId: 'bavi-9a-4-tent',
+    });
+    expect(checklistsStore.get(checklistId)?.checklistVersion).toBe(2);
+    expect(turn4Tent.checklistPreview.find((i: any) => i.categoryCode === 'TENT')).toMatchObject({
+      quantityRequired: 2,
+      quantityOwned: 1,
+      quantityMissing: 1,
+    });
+    expect(turn4Tent.reply).toContain('còn thiếu **1**');
+    expect(turn4Tent.reply).not.toContain('Checklist hiện tại');
+
+    // Turn 5: "Còn thiếu mấy lều?" -> CHECKLIST_ITEM_READ reads saved checklist -> còn thiếu 1, NO mutation, checklistVersion stays 2!
+    const turn5Read = await aiService.sendMessage(conv.id, user1Id, {
+      content: 'Còn thiếu mấy lều?',
+      clientMessageId: 'bavi-9a-5-read',
+    });
+    expect(turn5Read.reply).toContain('còn thiếu 1');
+    expect(turn5Read.reply).not.toContain('Đã cập nhật');
+    expect(checklistsStore.get(checklistId)?.checklistVersion).toBe(2);
+    expect(turn5Read.checklistPreview.find((i: any) => i.categoryCode === 'TENT')).toMatchObject({
+      quantityRequired: 2,
+      quantityOwned: 1,
+      quantityMissing: 1,
+    });
+
+    // Turn 6: Combined turn -> realtime QA disclaimer + "ghế xếp đã có 2 cáu"
+    const turn6Combined = await aiService.sendMessage(conv.id, user1Id, {
+      content: 'Thời tiết Ba Vì hôm nay thế nào? À ghế xếp đã có 2 cáu',
+      clientMessageId: 'bavi-9a-6-combined',
+    });
+    expect(turn6Combined.reply).toContain('thời gian thực');
+    expect(turn6Combined.reply).toContain('còn thiếu **2**');
+    expect(
+      turn6Combined.checklistPreview.find(
+        (i: any) => i.categoryCode === 'CAMPING_CHAIR',
+      ),
+    ).toMatchObject({
+      quantityRequired: 4,
+      quantityOwned: 2,
+      quantityMissing: 2,
+    });
+    expect(checklistsStore.get(checklistId)?.checklistVersion).toBe(3);
+
+    // Turn 7: Explicit checklist view ("Xem checklist") -> prints full checklist without mutating version
+    const turn7View = await aiService.sendMessage(conv.id, user1Id, {
+      content: 'Xem checklist',
+      clientMessageId: 'bavi-9a-7-view',
+    });
+    expect(turn7View.reply).toContain('Checklist hiện tại');
+    expect(checklistsStore.get(checklistId)?.checklistVersion).toBe(3);
+  });
+
+  // =========================================================================
+  // 10. PHASE 9A: ABORT SIGNAL ON TIMEOUT, 404/429/INVALID_SCHEMA, SAFE FALLBACK & ROLLBACK
+  // =========================================================================
+  it('aborts hung Gemini calls via AbortSignal, handles 404/429/TIMEOUT/INVALID_SCHEMA, falls back safely, and rolls back partial failures', async () => {
+    const conv = await aiService.createConversation(user1Id, {
+      initialMessage: 'Tôi muốn cắm trại Ba Vì 2 ngày, nhóm 4 người',
+      clientMessageId: 'resil-init-1',
+    });
+
+    // 1. Explicit simulated errors: NOT_FOUND (404), QUOTA_EXCEEDED (429), TIMEOUT, INVALID_SCHEMA
+    for (const sim of [
+      'NOT_FOUND',
+      'QUOTA_EXCEEDED',
+      'TIMEOUT',
+      'INVALID_SCHEMA',
+    ] as const) {
+      await expect(
+        aiService.sendMessage(conv.id, user1Id, {
+          content: 'Nhóm đổi thành 8 người',
+          clientMessageId: `resil-sim-${sim}`,
+          simulateError: sim,
+        }),
+      ).rejects.toThrow(HttpException);
+    }
+    expect((await aiService.getConversationById(conv.id, user1Id)).tripState.travelers).toBe(4);
+
+    // 2. Real AbortController timeout check via slow customGenerator & short timeoutMs
+    (configService.get as jest.Mock).mockImplementation((key: string) => {
+      if (key === 'gemini.apiKey') return 'fake-key-for-test';
+      if (key === 'gemini.model') return 'gemini-4-hydrogen';
+      if (key === 'gemini.timeoutMs') return 40;
+      return undefined;
+    });
+
+    let observedSignal: AbortSignal | undefined;
+    parser.setCustomGeminiGenerator(async (_prompt, signal) => {
+      observedSignal = signal;
+      return new Promise((_resolve) => {
+        // Never resolves within 40ms
+      });
+    });
+
+    await expect(
+      aiService.sendMessage(conv.id, user1Id, {
+        content: 'Nhóm đổi thành 6 người',
+        clientMessageId: 'resil-abort-timeout',
+      }),
+    ).rejects.toThrow(HttpException);
+    expect(observedSignal?.aborted).toBe(true);
+
+    // 3. Mocked 404 & 429 with fallback enabled: only clear updates apply; unrecognized questions preserve state
+    parser.setCustomGeminiGenerator(
+      async () => {
+        const err: any = new Error('404 models/gemini-4-hydrogen is not found');
+        err.status = 404;
+        throw err;
+      },
+      { allowFallbackOnError: true },
+    );
+
+    // Clear checklist mutation still succeeds via safe fallback
+    const fallbackMutation = await aiService.sendMessage(conv.id, user1Id, {
+      content: 'Nhóm đã có 1 lều',
+      clientMessageId: 'resil-fallback-tent',
+    });
+    expect(
+      fallbackMutation.checklistPreview.find((i: any) => i.categoryCode === 'TENT'),
+    ).toMatchObject({ quantityOwned: 1, quantityMissing: 1 });
+
+    // Unrecognized general question during 429/404 fallback leaves tripState & checklistVersion completely unchanged
+    const checklistId = String(fallbackMutation.conversation.checklistId);
+    const verBeforeUnknown = checklistsStore.get(checklistId)?.checklistVersion;
+
+    const fallbackUnknown = await aiService.sendMessage(conv.id, user1Id, {
+      content: 'Chính sách hoàn tiền thuê thiết bị bên bạn ra sao?',
+      clientMessageId: 'resil-fallback-unknown',
+    });
+    expect(fallbackUnknown.reply).toContain('giữ nguyên');
+    expect(checklistsStore.get(checklistId)?.checklistVersion).toBe(verBeforeUnknown);
+    expect(fallbackUnknown.tripState.travelers).toBe(4);
+    parser.setCustomGeminiGenerator(undefined);
+
+    // 4. Atomic compensating rollback when conversation CAS fails mid-turn ("có thêm 1 lều" must NOT stick if CAS conflicts)
+    const convDoc = aiConversationsStore.get(conv.id);
+    const msgsBeforeCas = aiMessagesStore.size;
+    // Spy on checklistModel.findByIdAndUpdate once to simulate another tab concurrently bumping stateVersion
+    const checklistsModelSpy = (aiService as any).checklistModel;
+    const realChecklistUpdate = checklistsModelSpy.findByIdAndUpdate;
+    const casSpy = jest
+      .spyOn(checklistsModelSpy, 'findByIdAndUpdate')
+      .mockImplementationOnce((id: any, update: any) => {
+        convDoc.stateVersion = convDoc.stateVersion + 5;
+        return realChecklistUpdate(id, update);
+      });
+
+    await expect(
+      aiService.sendMessage(conv.id, user1Id, {
+        content: 'Có thêm 1 lều',
+        clientMessageId: 'resil-cas-rollback',
+      }),
+    ).rejects.toThrow(ConflictException);
+
+    // Verify rolled back: message count unchanged and TENT owned is STILL 1 (not 2)!
+    expect(aiMessagesStore.size).toBe(msgsBeforeCas);
+    expect(
+      checklistsStore
+        .get(checklistId)
+        ?.items?.find((i: any) => i.categoryCode === 'TENT')?.quantityOwned,
+    ).toBe(1);
+  });
+
+  // =========================================================================
+  // 11. PHASE 9A SECTION 5 ACCEPTANCE: CONVERSATIONAL FLOWS, COREFERENCE "Ở ĐÓ",
+  //     NATURAL QUANTITY PATTERNS, PRE-CHECKLIST OVERRIDES & ERROR ISOLATION
+  // =========================================================================
+  it('satisfies all Phase 9A conversational, QA coreference, natural quantity, and resilience acceptance criteria', async () => {
+    const convChat = await aiService.createConversation(user1Id, {});
+
+    // Scenario 1: Greetings & thanks stay conversational without pushing questionnaire or mutating plan
+    const greetTurn = await aiService.sendMessage(convChat.id, user1Id, {
+      content: 'Chào bạn',
+      clientMessageId: 'p9a-s1-greet',
+    });
+    expect(greetTurn.tripState.destination).toBeNull();
+    expect(greetTurn.tripState.activity).toBeNull();
+    expect(greetTurn.conversation.checklistId).toBeNull();
+    expect(greetTurn.reply).toContain('Chào bạn');
+    expect(greetTurn.reply).not.toContain('Checklist hiện tại');
+
+    const thanksTurn = await aiService.sendMessage(convChat.id, user1Id, {
+      content: 'Cảm ơn',
+      clientMessageId: 'p9a-s1-thanks',
+    });
+    expect(thanksTurn.tripState.destination).toBeNull();
+    expect(thanksTurn.tripState.activity).toBeNull();
+
+    // Scenario 2: Destination QA ("Giới thiệu Ba Vì" -> "Ở đó có gì nổi bật?") uses recent conversation context without saving destination prematurely
+    const baviIntro = await aiService.sendMessage(convChat.id, user1Id, {
+      content: 'Giới thiệu Ba Vì',
+      clientMessageId: 'p9a-s2-intro',
+    });
+    expect(baviIntro.tripState.destination).toBeNull();
+    expect(baviIntro.reply).toContain('Ba Vì');
+
+    const baviFollowup = await aiService.sendMessage(convChat.id, user1Id, {
+      content: 'Ở đó có gì nổi bật?',
+      clientMessageId: 'p9a-s2-there',
+    });
+    expect(baviFollowup.tripState.destination).toBeNull();
+    expect(baviFollowup.reply).toContain('Ba Vì');
+
+    // Scenario 3: Multi-intent ("Giới thiệu Ba Vì, mình muốn đi ở đó") saves Ba Vì WITHOUT auto-assigning TREKKING
+    const convNoAutoTrek = await aiService.createConversation(user1Id, {});
+    const mixedStart = await aiService.sendMessage(convNoAutoTrek.id, user1Id, {
+      content: 'Giới thiệu Ba Vì, mình muốn đi ở đó',
+      clientMessageId: 'p9a-s3-mixed',
+    });
+    expect(mixedStart.reply).toContain('Ba Vì');
+    expect(mixedStart.tripState.destination).toBe('Vườn Quốc gia Ba Vì');
+    expect(mixedStart.tripState.activity).toBeNull();
+    expect(mixedStart.conversation.title).not.toContain('Trekking');
+
+    // Itinerary advice ("Lập lịch trình tham quan Ba Vì 2 ngày") distinguishes saved plan vs chat-only itinerary
+    const itineraryTurn = await aiService.sendMessage(convNoAutoTrek.id, user1Id, {
+      content: 'Lập lịch trình tham quan Ba Vì 2 ngày',
+      clientMessageId: 'p9a-s3-itinerary',
+    });
+    expect(itineraryTurn.tripState.durationDays).toBe(2);
+    expect(itineraryTurn.reply).toContain('lịch trình');
+    expect(itineraryTurn.reply).toContain('tham khảo');
+
+    // "Đi Yên Tử cần mang gì?" gives preliminary gear tips and asks missing field
+    const convYenTu = await aiService.createConversation(user1Id, {});
+    const yenTuTip = await aiService.sendMessage(convYenTu.id, user1Id, {
+      content: 'Đi Yên Tử cần mang gì?',
+      clientMessageId: 'p9a-yentu-tip',
+    });
+    expect(yenTuTip.tripState.destination).toBe('Yên Tử');
+    expect(yenTuTip.tripState.activity).toBeNull();
+    expect(yenTuTip.reply).toContain('Gợi ý đồ chuẩn bị sơ bộ');
+
+    // Scenario 4 & 5: Natural Vietnamese quantity patterns, ordering rules, clientMessageId idempotency & persistence
+    const convQty = await aiService.createConversation(user1Id, {});
+
+    // Pre-checklist manual override before trip info is complete -> persisted across unrelated turn & applied on creation
+    const preReq = await aiService.sendMessage(convQty.id, user1Id, {
+      content: 'Balo mình muốn 2 cái',
+      clientMessageId: 'p9a-s4-pre-req',
+    });
+    expect(preReq.tripState.requiredGearQuantities?.BACKPACK).toBe(2);
+
+    const tripStart = await aiService.sendMessage(convQty.id, user1Id, {
+      content: 'Cắm trại Ba Vì 1 ngày 3 người',
+      clientMessageId: 'p9a-s4-create',
+    });
+    expect(tripStart.status).toBe('READY_FOR_CHECKLIST');
+    const clId = String(tripStart.conversation.checklistId);
+
+    // "Tăng số lượng balo lên là 3" -> SET_REQUIRED(3)
+    const setReq3 = await aiService.sendMessage(convQty.id, user1Id, {
+      content: 'Tăng số lượng balo lên là 3',
+      clientMessageId: 'p9a-s5-set3',
+    });
+    expect(
+      setReq3.checklistPreview.find((i: any) => i.categoryCode === 'BACKPACK'),
+    ).toMatchObject({ quantityRequired: 3, userEditedRequired: true });
+
+    // "Thêm 2 balo" -> INCREMENT_REQUIRED(+2) => 5
+    const incReq2 = await aiService.sendMessage(convQty.id, user1Id, {
+      content: 'Thêm 2 balo',
+      clientMessageId: 'p9a-s5-inc2',
+    });
+    expect(
+      incReq2.checklistPreview.find((i: any) => i.categoryCode === 'BACKPACK'),
+    ).toMatchObject({ quantityRequired: 5, userEditedRequired: true });
+
+    // Retry same clientMessageId -> must NOT double-increment to 7
+    const incReq2Retry = await aiService.sendMessage(convQty.id, user1Id, {
+      content: 'Thêm 2 balo',
+      clientMessageId: 'p9a-s5-inc2',
+    });
+    expect(incReq2Retry.deduplicated).toBe(true);
+    expect(
+      incReq2Retry.checklistPreview.find((i: any) => i.categoryCode === 'BACKPACK')
+        ?.quantityRequired,
+    ).toBe(5);
+
+    // "Nhóm đã có 2 balo" -> owned = 2, then "Nhóm có thêm 2 balo rồi" -> owned = 4, missing = 1
+    await aiService.sendMessage(convQty.id, user1Id, {
+      content: 'Nhóm đã có 2 balo',
+      clientMessageId: 'p9a-s5-owned2',
+    });
+    const incOwned2 = await aiService.sendMessage(convQty.id, user1Id, {
+      content: 'Nhóm có thêm 2 balo rồi',
+      clientMessageId: 'p9a-s5-incowned2',
+    });
+    expect(
+      incOwned2.checklistPreview.find((i: any) => i.categoryCode === 'BACKPACK'),
+    ).toMatchObject({
+      quantityRequired: 5,
+      quantityOwned: 4,
+      quantityMissing: 1,
+    });
+
+    // "Mình muốn 3 người thì có 3 cái balo" -> travelers=3 + BACKPACK quantityRequired=3
+    const sameTurnThree = await aiService.sendMessage(convQty.id, user1Id, {
+      content: 'Mình muốn 3 người thì có 3 cái balo',
+      clientMessageId: 'p9a-s5-3pax3bag',
+    });
+    expect(sameTurnThree.tripState.travelers).toBe(3);
+    expect(
+      sameTurnThree.checklistPreview.find((i: any) => i.categoryCode === 'BACKPACK'),
+    ).toMatchObject({
+      quantityRequired: 3,
+      userEditedRequired: true,
+    });
+
+    // "À mình muốn 3 người nhưng chỉ dùng 1 balo thôi" -> rule sets 3, manual override sets 1
+    const overrideOne = await aiService.sendMessage(convQty.id, user1Id, {
+      content: 'À mình muốn 3 người nhưng chỉ dùng 1 balo thôi',
+      clientMessageId: 'p9a-s5-override1',
+    });
+    expect(overrideOne.tripState.travelers).toBe(3);
+    expect(
+      overrideOne.checklistPreview.find((i: any) => i.categoryCode === 'BACKPACK'),
+    ).toMatchObject({
+      quantityRequired: 1,
+      userEditedRequired: true,
+    });
+
+    // Updating unrelated field (duration -> 2 days) preserves manual override quantityRequired = 1 across regeneration & reload
+    const changeDuration = await aiService.sendMessage(convQty.id, user1Id, {
+      content: 'Đổi thành 2 ngày',
+      clientMessageId: 'p9a-s5-dur2',
+    });
+    expect(
+      changeDuration.checklistPreview.find(
+        (i: any) => i.categoryCode === 'BACKPACK',
+      ),
+    ).toMatchObject({
+      quantityRequired: 1,
+      userEditedRequired: true,
+    });
+
+    // Reload conversation & confirm persistence
+    const reloadedQty = await aiService.getConversationMessages(
+      convQty.id,
+      user1Id,
+      {
+        limit: 40,
+      },
+    );
+    expect(
+      reloadedQty.conversation.checklistPreview.find(
+        (i: any) => i.categoryCode === 'BACKPACK',
+      )?.quantityRequired,
+    ).toBe(1);
+
+    // "Thêm 1 tấm bạt" without "vào checklist" -> adds TARP = 1
+    const addTarpTurn = await aiService.sendMessage(convQty.id, user1Id, {
+      content: 'Thêm 1 tấm bạt',
+      clientMessageId: 'p9a-s5-addtarp',
+    });
+    expect(
+      addTarpTurn.checklistPreview.find((i: any) => i.categoryCode === 'TARP'),
+    ).toMatchObject({ quantityRequired: 1 });
+
+    // "Bớt 1 balo" -> ambiguous -> asks clarification and does NOT change quantity
+    const ambigBalos = await aiService.sendMessage(convQty.id, user1Id, {
+      content: 'Bớt 1 balo',
+      clientMessageId: 'p9a-s5-ambig',
+    });
+    expect(ambigBalos.reply).toContain('số lượng cần chuẩn bị');
+    expect(
+      ambigBalos.checklistPreview.find((i: any) => i.categoryCode === 'BACKPACK')
+        ?.quantityRequired,
+    ).toBe(1);
+
+    // Scenario 6: Read queries ("Còn thiếu mấy balo?") & General Q&A ("Balo trekking khác balo thường thế nào?") do NOT bump checklistVersion
+    const verBeforeReadAndQa = checklistsStore.get(clId)?.checklistVersion;
+
+    const readBalo = await aiService.sendMessage(convQty.id, user1Id, {
+      content: 'Còn thiếu mấy balo?',
+      clientMessageId: 'p9a-s6-readbalo',
+    });
+    expect(readBalo.reply).toContain('Balo');
+    expect(checklistsStore.get(clId)?.checklistVersion).toBe(verBeforeReadAndQa);
+
+    const generalCompare = await aiService.sendMessage(convQty.id, user1Id, {
+      content: 'Balo trekking khác balo thường thế nào?',
+      clientMessageId: 'p9a-s6-compare',
+    });
+    expect(generalCompare.reply.toLowerCase()).toContain('khung trợ lực');
+    expect(checklistsStore.get(clId)?.checklistVersion).toBe(verBeforeReadAndQa);
+
+    // Scenario 7: When Gemini throws 404/TIMEOUT, greetings & checklist commands STILL work cleanly,
+    // and open-ended provider-dependent Q&A gives a clear retry message WITHOUT combined fallback text
+    parser.setCustomGeminiGenerator(
+      async () => {
+        const err: any = new Error('404 models/gemini-4-hydrogen is not found');
+        err.status = 404;
+        throw err;
+      },
+      { allowFallbackOnError: true },
+    );
+
+    const greetUnder404 = await aiService.sendMessage(convQty.id, user1Id, {
+      content: 'Chào bạn',
+      clientMessageId: 'p9a-s7-greet404',
+    });
+    expect(greetUnder404.reply).toContain('Chào bạn');
+    expect(greetUnder404.reply).not.toContain('Gemini lỗi hoặc chưa hiểu');
+
+    const cmdUnder404 = await aiService.sendMessage(convQty.id, user1Id, {
+      content: 'Bỏ ghế xếp khỏi checklist',
+      clientMessageId: 'p9a-s7-remchair404',
+    });
+    expect(
+      cmdUnder404.checklistPreview.find(
+        (i: any) => i.categoryCode === 'CAMPING_CHAIR',
+      ),
+    ).toBeUndefined();
+
+    const openQaUnder404 = await aiService.sendMessage(convQty.id, user1Id, {
+      content: 'Kinh nghiệm chọn bếp cồn đi rừng?',
+      clientMessageId: 'p9a-s7-open404',
+    });
+    expect(openQaUnder404.reply).toContain('404');
+    expect(openQaUnder404.reply).not.toContain('chưa hiểu yêu cầu');
+
+    parser.setCustomGeminiGenerator(undefined);
   });
 });

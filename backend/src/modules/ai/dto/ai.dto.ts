@@ -70,11 +70,11 @@ export class SendAiMessageDto {
 
   @ApiPropertyOptional({
     description: 'Tùy chọn giả lập lỗi Gemini phục vụ kiểm thử khả năng phục hồi',
-    enum: ['TIMEOUT', 'QUOTA_EXCEEDED', 'INVALID_SCHEMA'],
+    enum: ['TIMEOUT', 'QUOTA_EXCEEDED', 'INVALID_SCHEMA', 'NOT_FOUND'],
   })
   @IsOptional()
-  @IsIn(['TIMEOUT', 'QUOTA_EXCEEDED', 'INVALID_SCHEMA'])
-  simulateError?: 'TIMEOUT' | 'QUOTA_EXCEEDED' | 'INVALID_SCHEMA';
+  @IsIn(['TIMEOUT', 'QUOTA_EXCEEDED', 'INVALID_SCHEMA', 'NOT_FOUND'])
+  simulateError?: 'TIMEOUT' | 'QUOTA_EXCEEDED' | 'INVALID_SCHEMA' | 'NOT_FOUND';
 }
 
 export class GetAiMessagesQueryDto {

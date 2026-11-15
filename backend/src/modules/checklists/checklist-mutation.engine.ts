@@ -10,6 +10,7 @@ export type ChecklistOperationIntent =
   | 'DECREMENT_OWNED'
   | 'SET_MISSING'
   | 'SET_REQUIRED'
+  | 'INCREMENT_REQUIRED'
   | 'ADD_ITEM'
   | 'REMOVE_ITEM'
   | 'AMBIGUOUS_DECREMENT'
@@ -436,10 +437,18 @@ export function buildChecklistEntriesFromRules(params: {
   travelers: number;
   ownedGearCodes?: string[];
   ownedGearQuantities?: Record<string, number>;
+  requiredGearQuantities?: Record<string, number>;
+  customGearItems?: Array<{
+    categoryCode: string;
+    itemName: string;
+    quantityRequired: number;
+    unit?: string;
+  }>;
   dbRules?: any[];
   previousItems?: ChecklistEntry[];
   removedItemCodes?: string[];
   didTravelersOrDurationChange?: boolean;
+  didTravelersChange?: boolean;
 }): ChecklistEntry[] {
   const rawActivity = params.activity || ActivityType.TREKKING;
   const effectiveActivity =
@@ -454,6 +463,9 @@ export function buildChecklistEntriesFromRules(params: {
     (params.ownedGearCodes || []).map((c) => String(c).toUpperCase()),
   );
   const explicitQuantities = params.ownedGearQuantities || {};
+  const explicitRequiredQuantities = params.requiredGearQuantities || {};
+  const scaleDimensionChanged =
+    params.didTravelersChange ?? params.didTravelersOrDurationChange ?? false;
   const removedSet = new Set(
     (params.removedItemCodes || []).map((c) => String(c).toUpperCase()),
   );
@@ -513,11 +525,29 @@ export function buildChecklistEntriesFromRules(params: {
       ruleQuantityRequired = travelers * durationDays;
     }
 
-    // Preserve userEditedRequired if trip scale did not change, or if user explicitly customized required quantity
+    const isDurationRule =
+      scalingRule === 'PER_PERSON_DAY_2L' || scalingRule === 'PER_PERSON_DAY';
+    const shouldRecomputeFromScale = isDurationRule
+      ? Boolean(params.didTravelersOrDurationChange)
+      : Boolean(scaleDimensionChanged);
+
+    // Preserve userEditedRequired if trip scale affecting this item did not change, or apply pending required override before first creation
+    const pendingExplicitRequired = explicitRequiredQuantities[code];
+    const hasPendingRequired =
+      typeof pendingExplicitRequired === 'number' &&
+      Number.isInteger(pendingExplicitRequired) &&
+      pendingExplicitRequired >= 1;
+
     const quantityRequired =
-      prevItem?.userEditedRequired && !params.didTravelersOrDurationChange
+      prevItem?.userEditedRequired && !shouldRecomputeFromScale
         ? prevItem.quantityRequired
-        : ruleQuantityRequired;
+        : !prevItem && hasPendingRequired
+          ? pendingExplicitRequired
+          : ruleQuantityRequired;
+
+    const isManualRequired =
+      (prevItem?.userEditedRequired && !shouldRecomputeFromScale) ||
+      (!prevItem && hasPendingRequired);
 
     const canRent =
       code === 'WATER_ELECTROLYTE' ||
@@ -583,8 +613,7 @@ export function buildChecklistEntriesFromRules(params: {
         requiredAttributes,
         ownedConfirmed,
         userEditedOwned,
-        userEditedRequired:
-          prevItem?.userEditedRequired && !params.didTravelersOrDurationChange,
+        userEditedRequired: Boolean(isManualRequired),
         isCustomItem: false,
         reason: dbOverride?.reasonTemplate || tpl.reasonTemplate,
       }),
@@ -606,6 +635,74 @@ export function buildChecklistEntriesFromRules(params: {
       entries.push(norm);
       includedCodes.add(norm.categoryCode);
     }
+  }
+
+  // Apply pre-checklist pending custom items or explicit required/owned quantities for items outside baseTemplates
+  for (const custom of params.customGearItems || []) {
+    const cCode = String(custom.categoryCode || '').toUpperCase();
+    if (!cCode || includedCodes.has(cCode) || removedSet.has(cCode)) continue;
+    const reqQty = Math.max(1, Math.floor(Number(custom.quantityRequired) || 1));
+    const ownedQty = Math.max(
+      0,
+      Math.floor(Number(explicitQuantities[cCode]) || 0),
+    );
+    const meta = GEAR_CATALOG_METADATA[cCode];
+    entries.push(
+      normalizeChecklistEntry({
+        itemId: `item_${cCode}`,
+        categoryCode: cCode,
+        name: meta?.defaultItemName || custom.itemName || cCode,
+        quantityRequired: reqQty,
+        quantityNeeded: reqQty,
+        quantityOwned: ownedQty,
+        quantityMissing: Math.max(0, reqQty - ownedQty),
+        unit: custom.unit || meta?.unit || 'chiếc',
+        priority: meta?.priority || ChecklistPriority.CONDITIONAL,
+        canRent: meta?.canRent ?? true,
+        isRentable: meta?.canRent ?? true,
+        ownedConfirmed: true,
+        userEditedOwned: ownedQty > 0,
+        userEditedRequired: true,
+        isCustomItem: true,
+        reason:
+          meta?.reasonTemplate ||
+          'Hạng mục được bổ sung trước theo yêu cầu của nhóm.',
+      }),
+    );
+    includedCodes.add(cCode);
+  }
+
+  for (const [rawCode, rawReq] of Object.entries(explicitRequiredQuantities)) {
+    const cCode = String(rawCode || '').toUpperCase();
+    const reqQty = Math.floor(Number(rawReq) || 0);
+    if (!cCode || reqQty < 1 || includedCodes.has(cCode) || removedSet.has(cCode)) {
+      continue;
+    }
+    const ownedQty = Math.max(
+      0,
+      Math.floor(Number(explicitQuantities[cCode]) || 0),
+    );
+    const meta = GEAR_CATALOG_METADATA[cCode];
+    entries.push(
+      normalizeChecklistEntry({
+        itemId: `item_${cCode}`,
+        categoryCode: cCode,
+        name: meta?.defaultItemName || cCode,
+        quantityRequired: reqQty,
+        quantityNeeded: reqQty,
+        quantityOwned: ownedQty,
+        quantityMissing: Math.max(0, reqQty - ownedQty),
+        unit: meta?.unit || 'chiếc',
+        priority: meta?.priority || ChecklistPriority.CONDITIONAL,
+        canRent: meta?.canRent ?? true,
+        isRentable: meta?.canRent ?? true,
+        ownedConfirmed: true,
+        userEditedOwned: ownedQty > 0,
+        userEditedRequired: true,
+        isCustomItem: true,
+      }),
+    );
+    includedCodes.add(cCode);
   }
 
   return entries;
@@ -702,6 +799,56 @@ export function applyStructuredChecklistOperations(params: {
         didMutate = true;
         appliedSummaries.push(
           `Đã ghi nhận bỏ **${meta?.defaultItemName || displayLabel}** khỏi checklist.`,
+        );
+      }
+      continue;
+    }
+
+    if (op.intent === 'INCREMENT_REQUIRED') {
+      const qtyToAdd = Math.max(1, Math.floor(Number(op.quantity) || 1));
+      removedSet.delete(code);
+      removedSet.delete(`item_${code}`);
+
+      const idx = findItemIndex(op);
+      if (idx !== -1) {
+        const current = items[idx];
+        const nextReq = current.quantityRequired + qtyToAdd;
+        const updated = normalizeChecklistEntry({
+          ...current,
+          quantityRequired: nextReq,
+          quantityNeeded: nextReq,
+          userEditedRequired: true,
+        });
+        items[idx] = updated;
+        didMutate = true;
+        appliedSummaries.push(
+          `Đã tăng thêm **${qtyToAdd} ${updated.unit}** vào **${updated.name}**: cần chuẩn bị **${updated.quantityRequired}** ${updated.unit}, đã có **${updated.quantityOwned}**, còn thiếu **${updated.quantityMissing}**.`,
+        );
+      } else {
+        const newEntry = normalizeChecklistEntry({
+          itemId: `item_${code}`,
+          categoryCode: code,
+          name: meta?.defaultItemName || op.itemName || code,
+          quantityRequired: qtyToAdd,
+          quantityNeeded: qtyToAdd,
+          quantityOwned: 0,
+          quantityMissing: qtyToAdd,
+          unit: op.unit || meta?.unit || 'chiếc',
+          priority: meta?.priority || ChecklistPriority.CONDITIONAL,
+          canRent: meta?.canRent ?? true,
+          isRentable: meta?.canRent ?? true,
+          ownedConfirmed: true,
+          userEditedOwned: false,
+          userEditedRequired: true,
+          isCustomItem: true,
+          reason:
+            meta?.reasonTemplate ||
+            'Hạng mục được bổ sung trực tiếp theo yêu cầu của nhóm.',
+        });
+        items.push(newEntry);
+        didMutate = true;
+        appliedSummaries.push(
+          `Đã thêm **${newEntry.name}** vào checklist: cần chuẩn bị **${newEntry.quantityRequired}** ${newEntry.unit}, đã có **0**, còn thiếu **${newEntry.quantityMissing}**.`,
         );
       }
       continue;

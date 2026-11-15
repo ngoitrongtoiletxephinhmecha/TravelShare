@@ -149,10 +149,10 @@ export const AiAssistantPage: React.FC = () => {
   const [ownedDrafts, setOwnedDrafts] = useState<Record<string, string>>({});
   const [sizeDrafts, setSizeDrafts] = useState<Record<string, string>>({});
 
-  // Matching Filter Form State
-  const [matchStartAt, setMatchStartAt] = useState('2026-12-10');
-  const [matchEndAt, setMatchEndAt] = useState('2026-12-12');
-  const [matchPickupArea, setMatchPickupArea] = useState('Đống Đa, Hà Nội');
+  // Matching Filter Form State (kept separate from tripState.departureDate; never hardcoded)
+  const [matchStartAt, setMatchStartAt] = useState('');
+  const [matchEndAt, setMatchEndAt] = useState('');
+  const [matchPickupArea, setMatchPickupArea] = useState('');
   const [matchBudgetInput, setMatchBudgetInput] = useState('');
   const [matchSharingType, setMatchSharingType] = useState<
     '' | 'RENT' | 'FREE_LOAN' | 'BOTH'
@@ -164,6 +164,7 @@ export const AiAssistantPage: React.FC = () => {
   const [isMatchStale, setIsMatchStale] = useState(false);
 
   const latestChecklistVersionRef = useRef<number>(0);
+  const skipNextConvLoadRef = useRef<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const checklistSectionRef = useRef<HTMLDivElement | null>(null);
 
@@ -206,6 +207,7 @@ export const AiAssistantPage: React.FC = () => {
   // Load messages, tripState, and saved Checklist whenever activeConversationId changes
   useEffect(() => {
     if (!isAuthenticated || !activeConversationId) {
+      skipNextConvLoadRef.current = null;
       setMessages([]);
       setTripState(createDefaultTripState());
       setStatus('NEEDS_INFORMATION');
@@ -220,7 +222,16 @@ export const AiAssistantPage: React.FC = () => {
       setChecklistId(null);
       setActiveChecklist(null);
       setMatchResult(null);
+      setMatchStartAt('');
+      setMatchEndAt('');
+      setMatchPickupArea('');
+      setMatchBudgetInput('');
       setAccessError(null);
+      return;
+    }
+
+    if (skipNextConvLoadRef.current === activeConversationId) {
+      skipNextConvLoadRef.current = null;
       return;
     }
 
@@ -232,6 +243,10 @@ export const AiAssistantPage: React.FC = () => {
     setMatchError(null);
     setMatchResult(null);
     setIsMatchStale(false);
+    setMatchStartAt('');
+    setMatchEndAt('');
+    setMatchPickupArea('');
+    setMatchBudgetInput('');
 
     (async () => {
       try {
@@ -251,16 +266,14 @@ export const AiAssistantPage: React.FC = () => {
         setTravelPlanId(conv.travelPlanId || null);
         setChecklistId(conv.checklistId || null);
 
-        // Pre-fill matching filter defaults from tripState if available
-        if (conv.tripState?.departureDate) {
-          setMatchStartAt(conv.tripState.departureDate);
-          if (conv.tripState.endDate) {
-            setMatchEndAt(conv.tripState.endDate);
-          }
-        }
-        if (conv.tripState?.pickupArea) {
-          setMatchPickupArea(conv.tripState.pickupArea);
-        }
+        // Pre-fill matching filter only from confirmed tripState values (or leave blank)
+        setMatchStartAt(conv.tripState?.departureDate || '');
+        setMatchEndAt(
+          conv.tripState?.departureDate && conv.tripState?.endDate
+            ? conv.tripState.endDate
+            : '',
+        );
+        setMatchPickupArea(conv.tripState?.pickupArea || '');
         if (
           conv.tripState?.budgetVnd !== null &&
           conv.tripState?.budgetVnd !== undefined
@@ -363,6 +376,7 @@ export const AiAssistantPage: React.FC = () => {
       if (!targetConvId) {
         const created = await aiService.createConversation({});
         targetConvId = created.id;
+        skipNextConvLoadRef.current = targetConvId;
         await queryClient.invalidateQueries({ queryKey: ['ai-conversations'] });
         navigate(`/ai-assistant/${targetConvId}`, { replace: true });
       }
@@ -425,13 +439,13 @@ export const AiAssistantPage: React.FC = () => {
       setChecklistId(nextClId || null);
 
       if (turnRes.tripState?.departureDate) {
-        setMatchStartAt(turnRes.tripState.departureDate);
+        setMatchStartAt((prev) => prev || turnRes.tripState.departureDate || '');
         if (turnRes.tripState.endDate) {
-          setMatchEndAt(turnRes.tripState.endDate);
+          setMatchEndAt((prev) => prev || turnRes.tripState.endDate || '');
         }
       }
       if (turnRes.tripState?.pickupArea) {
-        setMatchPickupArea(turnRes.tripState.pickupArea);
+        setMatchPickupArea((prev) => prev || turnRes.tripState.pickupArea || '');
       }
       if (
         turnRes.tripState?.budgetVnd !== null &&
@@ -456,10 +470,15 @@ export const AiAssistantPage: React.FC = () => {
       // If a checklist already exists, refresh full checklist detail (summary, versions, travelPlan)
       if (nextClId) {
         try {
+          const prevVersion = latestChecklistVersionRef.current;
           const refreshedCl = await checklistService.getChecklistById(nextClId);
           setActiveChecklist(refreshedCl);
           syncDraftsFromChecklist(refreshedCl);
-          if (matchResult) {
+          if (
+            matchResult &&
+            prevVersion > 0 &&
+            refreshedCl.checklistVersion !== prevVersion
+          ) {
             setIsMatchStale(true);
           }
         } catch {
@@ -569,11 +588,16 @@ export const AiAssistantPage: React.FC = () => {
     if (!activeChecklist) return;
     setUpdatingItemId(itemId);
     setChecklistError(null);
+    const expectedVersion =
+      latestChecklistVersionRef.current || activeChecklist.checklistVersion;
     try {
       const updated = await checklistService.updateChecklistItem(
         activeChecklist.id,
         itemId,
-        payload,
+        {
+          ...payload,
+          expectedChecklistVersion: expectedVersion,
+        },
       );
       setActiveChecklist(updated);
       syncDraftsFromChecklist(updated);
@@ -581,9 +605,31 @@ export const AiAssistantPage: React.FC = () => {
         setIsMatchStale(true);
       }
     } catch (err: any) {
+      const errObj = err?.response?.data?.error || err?.response?.data || {};
+      if (
+        err?.response?.status === 409 ||
+        errObj?.code === 'CHECKLIST_VERSION_CONFLICT'
+      ) {
+        try {
+          const latestCl =
+            errObj?.checklist ||
+            (await checklistService.getChecklistById(activeChecklist.id));
+          if (latestCl) {
+            setActiveChecklist(latestCl);
+            syncDraftsFromChecklist(latestCl);
+            setIsMatchStale(true);
+          }
+        } catch {
+          // ignore reload failure
+        }
+        setChecklistError(
+          errObj?.message ||
+            'Checklist vừa được cập nhật ở một tab khác. Hệ thống đã tải lại phiên bản mới nhất, vui lòng kiểm tra và lưu lại.',
+        );
+        return;
+      }
       const msg =
-        err?.response?.data?.error?.message ||
-        err?.response?.data?.message ||
+        errObj?.message ||
         'Không thể cập nhật số lượng đồ đã có.';
       setChecklistError(Array.isArray(msg) ? msg.join(', ') : msg);
     } finally {
@@ -594,6 +640,13 @@ export const AiAssistantPage: React.FC = () => {
   const handleMatchMissingGear = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!activeChecklist) return;
+
+    if (!matchStartAt || !matchEndAt) {
+      setMatchError(
+        'Vui lòng chọn ngày nhận đồ (startAt) và ngày trả đồ (endAt) trước khi tìm thiết bị còn thiếu.',
+      );
+      return;
+    }
 
     setMatchError(null);
     setMatchingGear(true);

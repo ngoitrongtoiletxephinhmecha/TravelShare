@@ -37,6 +37,12 @@ export class UpdateChecklistItemDto {
   @IsOptional()
   @IsString()
   note?: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  expectedChecklistVersion?: number;
 }
 
 export class AddChecklistItemDto {
@@ -69,6 +75,12 @@ export class AddChecklistItemDto {
   @IsOptional()
   @IsBoolean()
   canRent?: boolean;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  expectedChecklistVersion?: number;
 }
 
 export class MatchChecklistGearDto {

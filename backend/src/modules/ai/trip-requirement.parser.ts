@@ -21,12 +21,32 @@ export type AiErrorCode =
   | 'TIMEOUT'
   | 'QUOTA_EXCEEDED'
   | 'INVALID_SCHEMA'
+  | 'NOT_FOUND'
   | 'PROVIDER_ERROR';
+
+export type TurnActionType =
+  | 'SMALL_TALK'
+  | 'GENERAL_QA'
+  | 'ITINERARY_ADVICE'
+  | 'DESTINATION_QA'
+  | 'CHECKLIST_ITEM_READ'
+  | 'CHECKLIST_VIEW'
+  | 'CHECKLIST_CREATE'
+  | 'TRIP_UPDATE'
+  | 'CHECKLIST_MUTATION';
+
+export interface RecentMessageContext {
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  qaSubjectDestination?: string | null;
+  structuredPayload?: Record<string, any> | null;
+}
 
 export class AiProviderException extends Error {
   constructor(
     public readonly code: AiErrorCode,
     message: string,
+    public readonly httpStatus?: number,
   ) {
     super(message);
     this.name = 'AiProviderException';
@@ -38,16 +58,38 @@ export interface ExtractedTripPatch {
   clearedFields: Array<keyof ValidatedTripState>;
   ownedGearMode?: 'ADD' | 'REPLACE' | 'CLEAR';
   checklistOperations?: ParsedChecklistOperation[];
+  turnActions?: TurnActionType[];
+  qaQuestion?: string | null;
+  qaSubjectDestination?: string | null;
+  destinationAnswer?: string | null;
+  generalAnswer?: string | null;
+  itineraryAnswer?: string | null;
+  qaNeedsLiveDisclaimer?: boolean;
+  readChecklistCodes?: string[];
+  requestChecklistPrint?: boolean;
+  requestChecklistCreate?: boolean;
+  preliminaryGearSuggestion?: string | null;
+  isHowToQuestion?: boolean;
+  isUnrecognizedFallback?: boolean;
+  providerFailureCode?: AiErrorCode | null;
+  providerFailureNote?: string | null;
   ambiguousDateNote?: string | null;
   assistantHint?: string | null;
   providerMeta: {
     source: 'GEMINI' | 'VIETNAMESE_NLP_PARSER';
     model: string;
     latencyMs: number;
+    step?: string;
+    qaSource?: 'GEMINI' | 'LOCAL_KNOWLEDGE' | 'NONE';
+    fallbackReason?: AiErrorCode;
+    abortedOnTimeout?: boolean;
   };
 }
 
-export type CustomGeminiGenerator = (prompt: string) => Promise<string>;
+export type CustomGeminiGenerator = (
+  prompt: string,
+  signal?: AbortSignal,
+) => Promise<string>;
 
 const VIETNAMESE_NUMBER_WORDS: Record<string, number> = {
   một: 1,
@@ -112,80 +154,102 @@ const OWNED_GEAR_LEXICON: Array<{
   labelVi: string;
   unit: string;
 }> = [
-  {
-    pattern: /lều\s*cắm\s*trại|lều\s*trại|(?:^|[\s,.;])lều(?=$|[\s,.;])|\btent\b/i,
-    code: 'TENT',
-    labelVi: 'lều',
-    unit: 'bộ',
-  },
-  {
-    pattern:
-      /ghế\s*xếp|ghế\s*camping|ghế\s*gấp|bàn\s*ghế|(?:^|[\s,.;])ghế(?=$|[\s,.;])/i,
-    code: 'CAMPING_CHAIR',
-    labelVi: 'ghế xếp',
-    unit: 'chiếc',
-  },
-  {
-    pattern: /balo|ba\s*lô|\bbackpack\b/i,
-    code: 'BACKPACK',
-    labelVi: 'balo',
-    unit: 'chiếc',
-  },
-  {
-    pattern: /túi\s*ngủ|\bsleeping\s*bag\b/i,
-    code: 'SLEEPING_BAG',
-    labelVi: 'túi ngủ',
-    unit: 'chiếc',
-  },
-  {
-    pattern: /giày\s*trekking|giày\s*leo\s*núi|(?:^|[\s,.;])giày(?=$|[\s,.;])/i,
-    code: 'TREKKING_SHOES',
-    labelVi: 'giày trekking',
-    unit: 'đôi',
-  },
-  {
-    pattern: /gậy\s*trekking|gậy\s*leo\s*núi|(?:^|[\s,.;])gậy(?=$|[\s,.;])/i,
-    code: 'TREKKING_POLES',
-    labelVi: 'gậy trekking',
-    unit: 'cặp',
-  },
-  {
-    pattern: /áo\s*mưa|áo\s*khoác|áo\s*gió|\bjacket\b/i,
-    code: 'RAIN_JACKET',
-    labelVi: 'áo khoác / áo mưa',
-    unit: 'bộ',
-  },
-  {
-    pattern: /đèn\s*đội\s*đầu|đèn\s*pin|đèn\s*lồng|\bheadlamp\b/i,
-    code: 'HEADLAMP',
-    labelVi: 'đèn đội đầu',
-    unit: 'chiếc',
-  },
-  {
-    pattern:
-      /bếp\s*dã\s*ngoại|bếp\s*gas|bếp\s*nấu|bộ\s*nồi|(?:^|[\s,.;])bếp(?=$|[\s,.;])/i,
-    code: 'CAMPING_STOVE',
-    labelVi: 'bếp dã ngoại',
-    unit: 'bộ',
-  },
-  {
-    pattern:
-      /tấm\s*bạt|tăng\s*bạt|bạt\s*che|bạt\s*lót|(?:^|[\s,.;])bạt(?=$|[\s,.;])|\btarp\b/i,
-    code: 'TARP',
-    labelVi: 'tấm bạt',
-    unit: 'tấm',
-  },
-  {
-    pattern: /máy\s*ảnh|\bcamera\b|\bgopro\b/i,
-    code: 'CAMERA',
-    labelVi: 'máy ảnh',
-    unit: 'chiếc',
-  },
-];
+    {
+      pattern: /lều\s*cắm\s*trại|lều\s*trại|(?:^|[\s,.;])lều(?=$|[\s,.;])|\btent\b/i,
+      code: 'TENT',
+      labelVi: 'lều',
+      unit: 'bộ',
+    },
+    {
+      pattern:
+        /ghế\s*xếp|ghế\s*camping|ghế\s*gấp|bàn\s*ghế|(?:^|[\s,.;])ghế(?=$|[\s,.;])/i,
+      code: 'CAMPING_CHAIR',
+      labelVi: 'ghế xếp',
+      unit: 'chiếc',
+    },
+    {
+      pattern: /balo|ba\s*lô|\bbackpack\b/i,
+      code: 'BACKPACK',
+      labelVi: 'balo',
+      unit: 'chiếc',
+    },
+    {
+      pattern: /túi\s*ngủ|\bsleeping\s*bag\b/i,
+      code: 'SLEEPING_BAG',
+      labelVi: 'túi ngủ',
+      unit: 'chiếc',
+    },
+    {
+      pattern: /giày\s*trekking|giày\s*leo\s*núi|(?:^|[\s,.;])giày(?=$|[\s,.;])/i,
+      code: 'TREKKING_SHOES',
+      labelVi: 'giày trekking',
+      unit: 'đôi',
+    },
+    {
+      pattern: /gậy\s*trekking|gậy\s*leo\s*núi|(?:^|[\s,.;])gậy(?=$|[\s,.;])/i,
+      code: 'TREKKING_POLES',
+      labelVi: 'gậy trekking',
+      unit: 'cặp',
+    },
+    {
+      pattern: /áo\s*mưa|áo\s*khoác|áo\s*gió|\bjacket\b/i,
+      code: 'RAIN_JACKET',
+      labelVi: 'áo khoác / áo mưa',
+      unit: 'bộ',
+    },
+    {
+      pattern: /đèn\s*đội\s*đầu|đèn\s*pin|đèn\s*lồng|\bheadlamp\b/i,
+      code: 'HEADLAMP',
+      labelVi: 'đèn đội đầu',
+      unit: 'chiếc',
+    },
+    {
+      pattern:
+        /bếp\s*dã\s*ngoại|bếp\s*gas|bếp\s*nấu|bộ\s*nồi|(?:^|[\s,.;])bếp(?=$|[\s,.;])/i,
+      code: 'CAMPING_STOVE',
+      labelVi: 'bếp dã ngoại',
+      unit: 'bộ',
+    },
+    {
+      pattern:
+        /tấm\s*bạt|tăng\s*bạt|bạt\s*che|bạt\s*lót|(?:^|[\s,.;])bạt(?=$|[\s,.;])|\btarp\b/i,
+      code: 'TARP',
+      labelVi: 'tấm bạt',
+      unit: 'tấm',
+    },
+    {
+      pattern: /máy\s*ảnh|\bcamera\b|\bgopro\b/i,
+      code: 'CAMERA',
+      labelVi: 'máy ảnh',
+      unit: 'chiếc',
+    },
+  ];
 
 export const TRIP_EXTRACTION_RESPONSE_SCHEMA: Schema = {
   type: SchemaType.OBJECT,
   properties: {
+    turnIntent: {
+      type: SchemaType.STRING,
+      enum: [
+        'SMALL_TALK',
+        'DESTINATION_QA',
+        'GENERAL_QA',
+        'ITINERARY_ADVICE',
+        'TRIP_PLANNING',
+        'CHECKLIST_READ',
+        'CHECKLIST_VIEW',
+        'CHECKLIST_CREATE',
+        'CHECKLIST_MUTATION',
+        'MIXED',
+      ],
+      nullable: true,
+    },
+    qaAnswer: {
+      type: SchemaType.STRING,
+      description:
+        'Câu trả lời tiếng Việt tự nhiên cho chào hỏi, hỏi đáp kiến thức, giới thiệu địa điểm hoặc gợi ý lịch trình sơ bộ (không bịa giá vé/giờ mở cửa/thời tiết hôm nay)',
+      nullable: true,
+    },
     intent: {
       type: SchemaType.STRING,
       enum: ['PREPARE_TRIP', 'FIND_RENTAL_GEAR', 'GENERAL_QA'],
@@ -263,14 +327,27 @@ export const TRIP_EXTRACTION_RESPONSE_SCHEMA: Schema = {
 export class TripRequirementParser {
   private readonly logger = new Logger(TripRequirementParser.name);
   private customGenerator?: CustomGeminiGenerator;
+  private customQaGenerator?: CustomGeminiGenerator;
+  private customGeneratorOptions: { allowFallbackOnError?: boolean } = {};
 
-  constructor(private readonly configService: ConfigService) {}
+  constructor(private readonly configService: ConfigService) { }
 
   /**
-   * Allow unit/integration tests to inject a mock Gemini generator (to test schema errors, timeouts, quota)
+   * Allow unit/integration tests to inject a mock Gemini generator (to test 404, schema errors, timeouts, quota, AbortSignal)
    */
-  setCustomGeminiGenerator(generator?: CustomGeminiGenerator) {
+  setCustomGeminiGenerator(
+    generator?: CustomGeminiGenerator,
+    options?: { allowFallbackOnError?: boolean },
+  ) {
     this.customGenerator = generator;
+    this.customGeneratorOptions = options || {};
+  }
+
+  /**
+   * Allow tests to mock or override the Gemini Destination QA generator
+   */
+  setCustomQaGenerator(generator?: CustomGeminiGenerator) {
+    this.customQaGenerator = generator;
   }
 
   hasGeminiApiKey(): boolean {
@@ -279,50 +356,159 @@ export class TripRequirementParser {
   }
 
   /**
-   * Parse user message in Vietnamese into a structured patch (updatedFields + clearedFields)
+   * Parse user message in Vietnamese into structured turn actions, tripState patch, QA context & checklist operations
    */
   async parseUserTurn(
     userMessage: string,
     currentTripState: ValidatedTripState,
     options?: {
-      simulateError?: 'TIMEOUT' | 'QUOTA_EXCEEDED' | 'INVALID_SCHEMA';
+      simulateError?:
+      | 'TIMEOUT'
+      | 'QUOTA_EXCEEDED'
+      | 'INVALID_SCHEMA'
+      | 'NOT_FOUND';
       referenceDate?: Date;
+      recentMessages?: RecentMessageContext[];
+      lastAssistantQuestion?: string | null;
+      existingChecklistItems?: Array<{
+        categoryCode: string;
+        name: string;
+        quantityRequired: number;
+        quantityOwned: number;
+        quantityMissing: number;
+      }>;
     },
   ): Promise<ExtractedTripPatch> {
     const startTime = Date.now();
     const modelName =
-      this.configService.get<string>('gemini.model') || 'gemini-2.5-flash';
+      this.configService.get<string>('gemini.model') || 'gemini-4-hydrogen';
 
     // Handle explicit error simulation for testing resilience
+    if (options?.simulateError === 'NOT_FOUND') {
+      this.logger.warn(
+        `[AI][step=REQUIREMENT_PARSE] model=${modelName} code=NOT_FOUND httpStatus=404 durationMs=${Date.now() - startTime} simulated=true`,
+      );
+      throw new AiProviderException(
+        'NOT_FOUND',
+        `Không tìm thấy mô hình AI "${modelName}" trên Gemini API (404 Model Not Found). Trạng thái chuyến đi vẫn được giữ nguyên.`,
+        404,
+      );
+    }
     if (options?.simulateError === 'TIMEOUT') {
+      this.logger.warn(
+        `[AI][step=REQUIREMENT_PARSE] model=${modelName} code=TIMEOUT httpStatus=504 durationMs=${Date.now() - startTime} simulated=true`,
+      );
       throw new AiProviderException(
         'TIMEOUT',
         'Yêu cầu phân tích tới Gemini vượt quá thời gian chờ (Timeout). Thông tin chuyến đi của bạn vẫn được giữ nguyên, vui lòng thử lại.',
+        504,
       );
     }
     if (options?.simulateError === 'QUOTA_EXCEEDED') {
+      this.logger.warn(
+        `[AI][step=REQUIREMENT_PARSE] model=${modelName} code=QUOTA_EXCEEDED httpStatus=429 durationMs=${Date.now() - startTime} simulated=true`,
+      );
       throw new AiProviderException(
         'QUOTA_EXCEEDED',
         'Hệ thống Gemini tạm thời vượt hạn mức (Quota 429). Trạng thái chuyến đi đã lưu không bị ảnh hưởng, bạn có thể thử gửi lại.',
+        429,
       );
     }
     if (options?.simulateError === 'INVALID_SCHEMA') {
+      this.logger.warn(
+        `[AI][step=REQUIREMENT_PARSE] model=${modelName} code=INVALID_SCHEMA httpStatus=502 durationMs=${Date.now() - startTime} simulated=true`,
+      );
       throw new AiProviderException(
         'INVALID_SCHEMA',
         'Phản hồi từ mô hình AI không khớp lược đồ dữ liệu (Invalid Schema). Đã giữ nguyên trạng thái hợp lệ trước đó.',
+        502,
       );
     }
 
-    // 1. Always run deterministic Vietnamese NLP extraction as baseline
+    const convContext = this.extractConversationContext(
+      options?.recentMessages || [],
+      currentTripState,
+      options?.lastAssistantQuestion,
+    );
+
+    // 1. Analyze latest turn clauses using conversation history & current trip/checklist state
     const nlpPatch = this.extractVietnameseTripPatch(
       userMessage,
       currentTripState,
       options?.referenceDate,
+      convContext,
     );
 
-    // Fast-path: pure checklist item commands ("nhóm đã có 1 lều", "bỏ ghế xếp", "thêm 1 tấm bạt")
-    // are parsed deterministically in <1ms without blocking 15s+ on an external LLM call.
+    const turnActions = nlpPatch.turnActions || [];
+    const hasSmallTalkOnly =
+      turnActions.length === 1 && turnActions[0] === 'SMALL_TALK';
+    const hasDestinationQa = turnActions.includes('DESTINATION_QA');
+    const hasGeneralQa = turnActions.includes('GENERAL_QA');
+    const hasItineraryAdvice = turnActions.includes('ITINERARY_ADVICE');
+    const hasPlanningOrMutationText =
+      Object.keys(nlpPatch.updatedFields).length > 0 ||
+      nlpPatch.clearedFields.length > 0 ||
+      (nlpPatch.checklistOperations?.length || 0) > 0 ||
+      Boolean(nlpPatch.ambiguousDateNote) ||
+      Boolean(nlpPatch.requestChecklistCreate);
+
+    const hasReadOnlyActionsOnly =
+      !hasPlanningOrMutationText &&
+      (hasSmallTalkOnly ||
+        hasGeneralQa ||
+        hasItineraryAdvice ||
+        hasDestinationQa ||
+        turnActions.includes('CHECKLIST_ITEM_READ') ||
+        turnActions.includes('CHECKLIST_VIEW'));
+
+    // Deterministic fast-paths (zero external LLM latency & resilient when Gemini fails):
+    // 1) Pure greetings/thanks ("Chào bạn", "Cảm ơn")
+    if (!this.customGenerator && hasSmallTalkOnly && !hasPlanningOrMutationText) {
+      const latencyMs = Date.now() - startTime;
+      this.logger.log(
+        `[AI][step=SMALL_TALK] model=${modelName} durationMs=${latencyMs} source=VIETNAMESE_NLP_PARSER`,
+      );
+      return {
+        ...nlpPatch,
+        providerMeta: {
+          source: 'VIETNAMESE_NLP_PARSER',
+          model: modelName,
+          latencyMs,
+          step: 'SMALL_TALK',
+          qaSource: 'NONE',
+        },
+      };
+    }
+
+    // 2) Pure checklist read/view ("Còn thiếu mấy balo?", "Cho tôi xem checklist") without QA
+    if (
+      !this.customGenerator &&
+      !hasDestinationQa &&
+      !hasGeneralQa &&
+      !hasItineraryAdvice &&
+      hasReadOnlyActionsOnly
+    ) {
+      const latencyMs = Date.now() - startTime;
+      this.logger.log(
+        `[AI][step=READ_INTENT] model=${modelName} durationMs=${latencyMs} source=VIETNAMESE_NLP_PARSER actions=${turnActions.join(',')}`,
+      );
+      return {
+        ...nlpPatch,
+        providerMeta: {
+          source: 'VIETNAMESE_NLP_PARSER',
+          model: modelName,
+          latencyMs,
+          step: 'READ_INTENT',
+          qaSource: 'NONE',
+        },
+      };
+    }
+
+    // 3) Pure checklist item commands ("Thêm 2 balo", "Nhóm đã có 1 lều", "Bỏ ghế xếp khỏi checklist", "Bớt 1 balo")
     const hasOnlyChecklistOrOwnedUpdates =
+      !hasDestinationQa &&
+      !hasGeneralQa &&
+      !hasItineraryAdvice &&
       (nlpPatch.checklistOperations?.length || 0) > 0 &&
       Object.keys(nlpPatch.updatedFields).every(
         (k) => k === 'ownedGear' || k === 'ownedGearQuantities',
@@ -330,32 +516,73 @@ export class TripRequirementParser {
       nlpPatch.clearedFields.length === 0;
 
     if (!this.customGenerator && hasOnlyChecklistOrOwnedUpdates) {
+      const latencyMs = Date.now() - startTime;
+      this.logger.log(
+        `[AI][step=CHECKLIST_COMMAND] model=${modelName} durationMs=${latencyMs} source=VIETNAMESE_NLP_PARSER`,
+      );
       return {
         ...nlpPatch,
         providerMeta: {
           source: 'VIETNAMESE_NLP_PARSER',
           model: modelName,
-          latencyMs: Date.now() - startTime,
+          latencyMs,
+          step: 'CHECKLIST_COMMAND',
+          qaSource: 'NONE',
         },
       };
     }
 
-    // 2. If customGenerator (test) or GEMINI_API_KEY is present, invoke Gemini Structured Output
-    if (this.customGenerator || this.hasGeminiApiKey()) {
+    let finalPatch: Omit<ExtractedTripPatch, 'providerMeta'> = { ...nlpPatch };
+    let usedGeminiExtraction = false;
+    let abortedOnTimeout = false;
+    let fallbackReason: AiErrorCode | undefined;
+    let fallbackErrorMessage: string | undefined;
+    let geminiQaAnswer: string | null = null;
+
+    // Determine whether we should invoke Gemini structured analysis / conversational generation:
+    // - Whenever a test injects `customGenerator`
+    // - Whenever API key is present and the turn has planning extraction, unknown/open-ended intent, or general/itinerary Q&A
+    const hasAnyRecognizedDeterministicIntent =
+      hasPlanningOrMutationText ||
+      hasDestinationQa ||
+      hasGeneralQa ||
+      hasItineraryAdvice ||
+      turnActions.includes('CHECKLIST_ITEM_READ') ||
+      turnActions.includes('CHECKLIST_VIEW') ||
+      hasSmallTalkOnly;
+
+    const shouldInvokeExtraction =
+      (this.customGenerator || this.hasGeminiApiKey()) &&
+      (!hasReadOnlyActionsOnly ||
+        !hasAnyRecognizedDeterministicIntent ||
+        hasGeneralQa ||
+        hasItineraryAdvice);
+
+    if (shouldInvokeExtraction) {
       try {
         const rawJsonText = await this.invokeGeminiWithTimeout(
-          userMessage,
-          currentTripState,
+          this.buildExtractionPrompt(
+            userMessage,
+            currentTripState,
+            options?.recentMessages || [],
+            options?.existingChecklistItems || [],
+            convContext.lastMentionedDestination,
+          ),
           modelName,
+          {
+            step: 'REQUIREMENT_PARSE',
+            responseSchema: TRIP_EXTRACTION_RESPONSE_SCHEMA,
+          },
         );
         const geminiPatch = this.validateAndNormalizeGeminiPatch(rawJsonText);
+        usedGeminiExtraction = true;
+        geminiQaAnswer = geminiPatch.qaAnswer || null;
 
-        // Merge Gemini patch with deterministic Vietnamese NLP patch (NLP guarantees exact Vietnamese number/place/checklist accuracy)
         const SafeGeminiUpdated: Partial<ValidatedTripState> = {
           ...geminiPatch.updatedFields,
         };
 
-        // Prevent Gemini from misinterpreting gear item quantities (e.g. "1 lều", "2 cáu", "3 lều") as travelers or durationDays
+        // Guard against Gemini guessing TREKKING or overwriting existing fields on QA/chat/checklist-only turns
         if (
           nlpPatch.checklistOperations &&
           nlpPatch.checklistOperations.length > 0
@@ -372,6 +599,30 @@ export class TripRequirementParser {
           if (nlpPatch.updatedFields.destination === undefined) {
             delete SafeGeminiUpdated.destination;
           }
+        }
+        if (hasDestinationQa && !nlpPatch.updatedFields.destination) {
+          delete SafeGeminiUpdated.destination;
+        }
+        if (
+          SafeGeminiUpdated.activity &&
+          nlpPatch.updatedFields.activity === undefined &&
+          !this.textMentionsExplicitActivity(userMessage)
+        ) {
+          delete SafeGeminiUpdated.activity;
+        }
+
+        const isGeminiPureQaOrChat =
+          (geminiPatch.turnIntent === 'SMALL_TALK' ||
+            geminiPatch.turnIntent === 'GENERAL_QA' ||
+            geminiPatch.turnIntent === 'DESTINATION_QA') &&
+          !hasPlanningOrMutationText;
+
+        if (isGeminiPureQaOrChat) {
+          delete SafeGeminiUpdated.destination;
+          delete SafeGeminiUpdated.activity;
+          delete SafeGeminiUpdated.durationDays;
+          delete SafeGeminiUpdated.travelers;
+          delete SafeGeminiUpdated.intent;
         }
 
         const mergedUpdated: Partial<ValidatedTripState> = {
@@ -404,112 +655,376 @@ export class TripRequirementParser {
           ]),
         ) as Array<keyof ValidatedTripState>;
 
-        return {
+        const mergedActions = new Set<TurnActionType>(turnActions);
+        if (geminiPatch.turnIntent === 'GENERAL_QA' || (geminiQaAnswer && isGeminiPureQaOrChat)) {
+          mergedActions.add('GENERAL_QA');
+        }
+        if (geminiPatch.turnIntent === 'SMALL_TALK') {
+          mergedActions.add('SMALL_TALK');
+        }
+        if (geminiPatch.turnIntent === 'ITINERARY_ADVICE') {
+          mergedActions.add('ITINERARY_ADVICE');
+        }
+        if (
+          Object.keys(mergedUpdated).some(
+            (k) => k !== 'ownedGear' && k !== 'ownedGearQuantities',
+          ) ||
+          mergedCleared.length > 0
+        ) {
+          mergedActions.add('TRIP_UPDATE');
+        }
+
+        finalPatch = {
+          ...finalPatch,
           updatedFields: mergedUpdated,
           clearedFields: mergedCleared,
           ownedGearMode: nlpPatch.ownedGearMode || geminiPatch.ownedGearMode,
           checklistOperations: nlpPatch.checklistOperations || [],
+          turnActions: Array.from(mergedActions),
           ambiguousDateNote:
             nlpPatch.ambiguousDateNote || geminiPatch.ambiguousDateNote,
-          providerMeta: {
-            source: 'GEMINI',
-            model: modelName,
-            latencyMs: Date.now() - startTime,
-          },
         };
       } catch (err: any) {
-        if (err instanceof AiProviderException) {
-          // In unit tests with customGenerator (e.g. malformed JSON), propagate INVALID_SCHEMA;
-          // for real network TIMEOUT/QUOTA_EXCEEDED, fall back gracefully to Vietnamese NLP parser so chat never stalls with 503.
-          if (this.customGenerator || err.code === 'INVALID_SCHEMA') {
-            throw err;
+        const classified = this.classifyProviderError(err, modelName);
+        if (classified.code === 'TIMEOUT') {
+          abortedOnTimeout = true;
+        }
+        fallbackReason = classified.code;
+        fallbackErrorMessage = classified.message;
+
+        const allowFallback =
+          !this.customGenerator ||
+          Boolean(this.customGeneratorOptions.allowFallbackOnError);
+
+        if (
+          !allowFallback ||
+          (!this.customGeneratorOptions.allowFallbackOnError &&
+            classified.code === 'INVALID_SCHEMA' &&
+            this.customGenerator)
+        ) {
+          throw classified;
+        }
+
+        this.logger.warn(
+          `[AI][step=REQUIREMENT_PARSE] model=${modelName} code=${classified.code} httpStatus=${classified.httpStatus ?? 500} durationMs=${Date.now() - startTime} fallback=VIETNAMESE_NLP_PARSER message=${classified.message}`,
+        );
+      }
+    }
+
+    // 3. Answer DESTINATION_QA if requested in the latest message
+    let qaSource: 'GEMINI' | 'LOCAL_KNOWLEDGE' | 'NONE' = 'NONE';
+    if (hasDestinationQa) {
+      const qaSubject =
+        finalPatch.qaSubjectDestination ||
+        finalPatch.updatedFields.destination ||
+        convContext.lastMentionedDestination ||
+        currentTripState.destination ||
+        null;
+      const qaResult = await this.resolveDestinationQa(
+        userMessage,
+        finalPatch.qaQuestion || userMessage,
+        qaSubject,
+        currentTripState,
+        modelName,
+        geminiQaAnswer,
+      );
+      finalPatch.qaSubjectDestination = qaSubject;
+      finalPatch.destinationAnswer = qaResult.answer;
+      finalPatch.qaNeedsLiveDisclaimer = qaResult.needsLiveDisclaimer;
+      qaSource = qaResult.qaSource;
+      if (qaResult.abortedOnTimeout) {
+        abortedOnTimeout = true;
+      }
+    }
+
+    // 4. Handle GENERAL_QA / ITINERARY_ADVICE / open-ended conversational answer
+    const effectiveActions = finalPatch.turnActions || [];
+    const hasMutatingOrReadAction =
+      Object.keys(finalPatch.updatedFields).length > 0 ||
+      finalPatch.clearedFields.length > 0 ||
+      (finalPatch.checklistOperations?.length || 0) > 0 ||
+      (finalPatch.readChecklistCodes?.length || 0) > 0 ||
+      Boolean(finalPatch.requestChecklistPrint) ||
+      Boolean(finalPatch.requestChecklistCreate) ||
+      hasDestinationQa ||
+      hasSmallTalkOnly;
+
+    if (
+      effectiveActions.includes('ITINERARY_ADVICE') &&
+      !finalPatch.itineraryAnswer
+    ) {
+      if (geminiQaAnswer) {
+        finalPatch.itineraryAnswer = geminiQaAnswer;
+        qaSource = 'GEMINI';
+      } else {
+        const itRes = await this.resolveGeneralOrItineraryAnswer(
+          'ITINERARY_ADVICE',
+          userMessage,
+          currentTripState,
+          modelName,
+          options?.recentMessages || [],
+          fallbackReason,
+        );
+        finalPatch.itineraryAnswer = itRes.answer;
+        if (itRes.qaSource !== 'NONE') qaSource = itRes.qaSource;
+        if (itRes.providerFailureCode) {
+          fallbackReason = itRes.providerFailureCode;
+          fallbackErrorMessage = itRes.providerFailureNote || fallbackErrorMessage;
+        }
+      }
+    } else if (
+      (effectiveActions.includes('GENERAL_QA') || !hasMutatingOrReadAction) &&
+      !finalPatch.generalAnswer
+    ) {
+      if (geminiQaAnswer) {
+        finalPatch.generalAnswer = geminiQaAnswer;
+        qaSource = 'GEMINI';
+        if (!effectiveActions.includes('GENERAL_QA')) {
+          finalPatch.turnActions = [...effectiveActions, 'GENERAL_QA'];
+        }
+      } else {
+        const genRes = await this.resolveGeneralOrItineraryAnswer(
+          'GENERAL_QA',
+          userMessage,
+          currentTripState,
+          modelName,
+          options?.recentMessages || [],
+          fallbackReason,
+        );
+        if (genRes.answer) {
+          finalPatch.generalAnswer = genRes.answer;
+          qaSource = genRes.qaSource;
+          if (!effectiveActions.includes('GENERAL_QA')) {
+            finalPatch.turnActions = [...effectiveActions, 'GENERAL_QA'];
           }
-          this.logger.warn(
-            `Gemini ${err.code} (${err.message}), falling back to Vietnamese NLP parser.`,
-          );
-        } else {
-          const msg = String(err?.message || err);
-          if (this.customGenerator && /timeout|timed out|abort/i.test(msg)) {
-            throw new AiProviderException(
-              'TIMEOUT',
-              'Kết nối tới Gemini API quá thời gian chờ (Timeout). Trạng thái chuyến đi đã được bảo toàn.',
-            );
-          }
-          if (
-            this.customGenerator &&
-            /429|quota|rate limit|resource_exhausted/i.test(msg)
-          ) {
-            throw new AiProviderException(
-              'QUOTA_EXCEEDED',
-              'Gemini API tạm thời hết hạn mức (Quota Exceeded). Trạng thái chuyến đi đã được bảo toàn.',
-            );
-          }
-          this.logger.warn(
-            `Gemini call failed (${msg}), falling back to Vietnamese NLP parser.`,
-          );
+        } else if (genRes.providerFailureCode) {
+          finalPatch.providerFailureCode = genRes.providerFailureCode;
+          finalPatch.providerFailureNote =
+            genRes.providerFailureNote || fallbackErrorMessage || null;
         }
       }
     }
 
+    const totalLatency = Date.now() - startTime;
+    const isUnrecognized =
+      !hasMutatingOrReadAction &&
+      !finalPatch.generalAnswer &&
+      !finalPatch.itineraryAnswer &&
+      !finalPatch.ambiguousDateNote &&
+      !finalPatch.providerFailureCode;
+
+    if (fallbackReason && isUnrecognized) {
+      finalPatch.providerFailureCode = fallbackReason;
+      finalPatch.providerFailureNote =
+        fallbackErrorMessage ||
+        this.buildRetryNoticeForCode(fallbackReason, modelName);
+    } else if (isUnrecognized) {
+      finalPatch.isUnrecognizedFallback = true;
+      this.logger.warn(
+        `[AI][step=INTENT_CLASSIFY] model=${modelName} code=UNRECOGNIZED_INTENT durationMs=${totalLatency} source=VIETNAMESE_NLP_PARSER`,
+      );
+    }
+
+    const source: 'GEMINI' | 'VIETNAMESE_NLP_PARSER' =
+      usedGeminiExtraction || qaSource === 'GEMINI'
+        ? 'GEMINI'
+        : 'VIETNAMESE_NLP_PARSER';
+
+    const stepName = hasDestinationQa
+      ? hasPlanningOrMutationText
+        ? 'COMBINED_QA_AND_PARSE'
+        : 'DESTINATION_QA'
+      : effectiveActions.includes('ITINERARY_ADVICE')
+        ? 'ITINERARY_ADVICE'
+        : effectiveActions.includes('GENERAL_QA')
+          ? 'GENERAL_QA'
+          : hasSmallTalkOnly
+            ? 'SMALL_TALK'
+            : 'REQUIREMENT_PARSE';
+
+    this.logger.log(
+      `[AI][step=${stepName}] model=${modelName} durationMs=${totalLatency} source=${source} qaSource=${qaSource}${fallbackReason ? ` fallbackReason=${fallbackReason}` : ''}`,
+    );
+
     return {
-      ...nlpPatch,
+      ...finalPatch,
       providerMeta: {
-        source: 'VIETNAMESE_NLP_PARSER',
+        source,
         model: modelName,
-        latencyMs: Date.now() - startTime,
+        latencyMs: totalLatency,
+        step: stepName,
+        qaSource,
+        ...(fallbackReason ? { fallbackReason } : {}),
+        ...(abortedOnTimeout ? { abortedOnTimeout: true } : {}),
       },
     };
   }
 
-  private async invokeGeminiWithTimeout(
+  private buildExtractionPrompt(
     userMessage: string,
     currentTripState: ValidatedTripState,
-    modelName: string,
-  ): Promise<string> {
-    const timeoutMs =
-      this.configService.get<number>('gemini.timeoutMs') || 15000;
+    recentMessages: RecentMessageContext[] = [],
+    existingChecklistItems: Array<{
+      categoryCode: string;
+      name: string;
+      quantityRequired: number;
+      quantityOwned: number;
+      quantityMissing: number;
+    }> = [],
+    lastMentionedDestination?: string | null,
+  ): string {
+    const historyLines = recentMessages
+      .slice(-6)
+      .map(
+        (m) =>
+          `${m.role === 'user' ? 'Người dùng' : 'Trợ lý'}: ${String(m.content || '').slice(0, 220)}`,
+      )
+      .join('\n');
 
-    const prompt = [
-      'Bạn là bộ trích xuất yêu cầu chuyến đi (Requirement Parser) của nền tảng TravelShare Việt Nam.',
-      'Hãy chỉ trích xuất những trường MỚI xuất hiện hoặc ĐƯỢC SỬA trong tin nhắn mới nhất của người dùng.',
-      'Nếu một trường không được nhắc tới trong tin nhắn mới nhất, hãy để null (KHÔNG tự bịa giá trị).',
-      'Nếu người dùng yêu cầu xóa/bỏ một thông tin đã nhập (ví dụ: bỏ ngày đi, xóa ngân sách), thêm tên trường vào mảng clearedFields.',
-      `Trạng thái hiện tại: ${JSON.stringify(currentTripState)}`,
+    return [
+      'Bạn là Trợ lý AI TravelShare tại Việt Nam (chatbot du lịch & chuẩn bị đồ dã ngoại).',
+      'Hãy phân tích Ý ĐỊNH CỦA TIN NHẮN MỚI NHẤT dựa trên lịch sử hội thoại gần đây, tripState hiện tại và danh sách checklist đang lưu.',
+      'QUY TẮC BẮT BUỘC:',
+      '1. Nếu người dùng chỉ chào hỏi, cảm ơn (`SMALL_TALK`) hoặc hỏi kiến thức chung (`GENERAL_QA` như so sánh balo trekking vs balo thường, cách thao tác...) hoặc hỏi thông tin địa điểm (`DESTINATION_QA`): trả `turnIntent` tương ứng, viết `qaAnswer` tự nhiên bằng tiếng Việt, và ĐỂ `destination/activity/durationDays/travelers` là `null` nếu họ chưa chốt kế hoạch đi.',
+      '2. KHÔNG tự gán `activity = "TREKKING"` khi người dùng chỉ nói "Tôi muốn đi Ba Vì" hoặc "mình muốn đi ở đó" mà chưa nêu loại hoạt động.',
+      '3. Với câu hỏi địa điểm hoặc lịch trình: KHÔNG bịa giá vé hôm nay, giờ mở cửa hôm nay hay thời tiết thời gian thực nếu không có nguồn cập nhật.',
+      '4. Nếu tin nhắn nhắc "ở đó", tham chiếu tới địa điểm vừa nhắc trong hội thoại (`' +
+      (lastMentionedDestination || currentTripState.destination || 'chưa có') +
+      '`).',
+      '5. Nếu yêu cầu xóa trường đã nhập, đưa tên trường vào `clearedFields`.',
+      historyLines ? `Lịch sử gần đây:\n${historyLines}` : 'Chưa có lịch sử trước đó.',
+      `tripState hiện tại: ${JSON.stringify(currentTripState)}`,
+      existingChecklistItems.length > 0
+        ? `Checklist hiện tại: ${JSON.stringify(
+          existingChecklistItems.map((i) => ({
+            code: i.categoryCode,
+            name: i.name,
+            required: i.quantityRequired,
+            owned: i.quantityOwned,
+            missing: i.quantityMissing,
+          })),
+        )}`
+        : 'Chưa tạo checklist.',
       `Tin nhắn mới nhất của người dùng: "${userMessage}"`,
     ].join('\n');
+  }
+
+  private classifyProviderError(err: any, modelName: string): AiProviderException {
+    if (err instanceof AiProviderException) {
+      return err;
+    }
+    const status = Number(err?.status || err?.statusCode || err?.response?.status);
+    const msg = String(err?.message || err || '');
+
+    if (
+      status === 404 ||
+      /\b404\b|not found|models\/.*not/i.test(msg)
+    ) {
+      return new AiProviderException(
+        'NOT_FOUND',
+        `Không tìm thấy mô hình AI "${modelName}" (404). Trạng thái chuyến đi đã được giữ nguyên.`,
+        404,
+      );
+    }
+    if (
+      status === 429 ||
+      /429|quota|rate limit|resource_exhausted/i.test(msg)
+    ) {
+      return new AiProviderException(
+        'QUOTA_EXCEEDED',
+        'Gemini API tạm thời hết hạn mức (Quota 429). Trạng thái chuyến đi đã được bảo toàn.',
+        429,
+      );
+    }
+    if (
+      err?.name === 'AbortError' ||
+      /timeout|timed out|aborted|abort/i.test(msg)
+    ) {
+      return new AiProviderException(
+        'TIMEOUT',
+        'Kết nối tới Gemini API quá thời gian chờ (Timeout). Trạng thái chuyến đi đã được bảo toàn.',
+        504,
+      );
+    }
+    return new AiProviderException(
+      'PROVIDER_ERROR',
+      `Lỗi kết nối Gemini API (${msg.slice(0, 120)}).`,
+      status || 502,
+    );
+  }
+
+  private async invokeGeminiWithTimeout(
+    prompt: string,
+    modelName: string,
+    options?: {
+      step?: string;
+      responseSchema?: Schema;
+      responseMimeType?: string;
+      generatorOverride?: CustomGeminiGenerator;
+    },
+  ): Promise<string> {
+    const timeoutMs =
+      this.configService.get<number>('gemini.timeoutMs') || 60000;
+    const step = options?.step || 'GEMINI_CALL';
+    const callStart = Date.now();
+    const controller = new AbortController();
+
+    const activeCustomGen = options?.generatorOverride || this.customGenerator;
 
     const callPromise = (async () => {
-      if (this.customGenerator) {
-        return this.customGenerator(prompt);
+      if (activeCustomGen) {
+        return activeCustomGen(prompt, controller.signal);
       }
       const apiKey = this.configService.get<string>('gemini.apiKey')!;
       const genAI = new GoogleGenerativeAI(apiKey);
+      const generationConfig: Record<string, any> = {
+        temperature: options?.responseSchema ? 0.1 : 0.4,
+      };
+      if (options?.responseMimeType) {
+        generationConfig.responseMimeType = options.responseMimeType;
+      } else if (options?.responseSchema) {
+        generationConfig.responseMimeType = 'application/json';
+      }
+      if (options?.responseSchema) {
+        generationConfig.responseSchema = options.responseSchema;
+      }
+
       const model = genAI.getGenerativeModel({
         model: modelName,
-        generationConfig: {
-          temperature: 0.1,
-          responseMimeType: 'application/json',
-          responseSchema: TRIP_EXTRACTION_RESPONSE_SCHEMA,
-        },
+        generationConfig,
       });
-      const result = await model.generateContent(prompt);
+      const result = await model.generateContent(prompt, {
+        signal: controller.signal,
+        timeout: timeoutMs,
+      });
       return result.response.text();
     })();
 
     let timer: NodeJS.Timeout | undefined;
     const timeoutPromise = new Promise<string>((_, reject) => {
       timer = setTimeout(() => {
-        reject(
-          new AiProviderException(
-            'TIMEOUT',
-            `Gemini API không phản hồi sau ${timeoutMs}ms`,
-          ),
+        controller.abort();
+        const exc = new AiProviderException(
+          'TIMEOUT',
+          `Gemini API không phản hồi sau ${timeoutMs}ms`,
+          504,
         );
+        reject(exc);
       }, timeoutMs);
     });
 
     try {
-      return await Promise.race([callPromise, timeoutPromise]);
+      const output = await Promise.race([callPromise, timeoutPromise]);
+      this.logger.log(
+        `[AI][step=${step}] model=${modelName} durationMs=${Date.now() - callStart} source=GEMINI outcome=OK`,
+      );
+      return output;
+    } catch (err: any) {
+      const classified = this.classifyProviderError(err, modelName);
+      this.logger.warn(
+        `[AI][step=${step}] model=${modelName} durationMs=${Date.now() - callStart} source=GEMINI outcome=${classified.code}`,
+      );
+      throw classified;
     } finally {
       if (timer) clearTimeout(timer);
     }
@@ -521,7 +1036,10 @@ export class TripRequirementParser {
   validateAndNormalizeGeminiPatch(rawJson: string): Omit<
     ExtractedTripPatch,
     'providerMeta'
-  > {
+  > & {
+    turnIntent?: string | null;
+    qaAnswer?: string | null;
+  } {
     let parsed: any;
     try {
       parsed = JSON.parse(rawJson);
@@ -541,6 +1059,45 @@ export class TripRequirementParser {
 
     const updatedFields: Partial<ValidatedTripState> = {};
     const clearedFields: Array<keyof ValidatedTripState> = [];
+
+    const validTurnIntents = [
+      'SMALL_TALK',
+      'GENERAL_QA',
+      'ITINERARY_ADVICE',
+      'DESTINATION_QA',
+      'CHECKLIST_ITEM_READ',
+      'CHECKLIST_VIEW',
+      'CHECKLIST_CREATE',
+      'TRIP_UPDATE',
+      'CHECKLIST_MUTATION',
+      'MIXED',
+    ];
+    let turnIntent: string | null = null;
+    if (parsed.turnIntent !== undefined && parsed.turnIntent !== null) {
+      if (
+        typeof parsed.turnIntent !== 'string' ||
+        !validTurnIntents.includes(parsed.turnIntent)
+      ) {
+        throw new AiProviderException(
+          'INVALID_SCHEMA',
+          `Giá trị turnIntent không hợp lệ: ${String(parsed.turnIntent)}`,
+        );
+      }
+      turnIntent = parsed.turnIntent;
+    }
+
+    let qaAnswer: string | null = null;
+    if (parsed.qaAnswer !== undefined && parsed.qaAnswer !== null) {
+      if (typeof parsed.qaAnswer !== 'string') {
+        throw new AiProviderException(
+          'INVALID_SCHEMA',
+          'Trường qaAnswer phải là chuỗi ký tự.',
+        );
+      }
+      if (parsed.qaAnswer.trim()) {
+        qaAnswer = parsed.qaAnswer.trim();
+      }
+    }
 
     if (parsed.intent !== undefined && parsed.intent !== null) {
       const validIntents = ['PREPARE_TRIP', 'FIND_RENTAL_GEAR', 'GENERAL_QA'];
@@ -695,6 +1252,646 @@ export class TripRequirementParser {
       updatedFields,
       clearedFields,
       ambiguousDateNote: parsed.ambiguousDateNote || null,
+      ...(turnIntent ? { turnIntent } : {}),
+      ...(qaAnswer ? { qaAnswer } : {}),
+    };
+  }
+
+  private static readonly DESTINATION_GUIDE_VI: Record<string, string> = {
+    'Vườn Quốc gia Ba Vì':
+      '**Vườn Quốc gia Ba Vì** (Ba Vì, Hà Nội — cách trung tâm Hà Nội khoảng 50–60km về phía Tây) nổi bật với không khí mát mẻ quanh năm, rừng thông cổ thụ, cung đường đèo lên các cốt 400m – 600m – 1100m, Đỉnh Vua, Đền Thượng, Nhà thờ cổ rêu phong, vườn xương rồng và mùa hoa dã quỳ cuối thu (thường tháng 10–11). Địa hình kết hợp bãi trại dưới tán rừng thông và các tuyến trekking ngắn/trung bình rất phù hợp cắm trại cuối tuần.',
+    'Yên Tử':
+      '**Khu di tích & rừng quốc gia Yên Tử** (Uông Bí, Quảng Ninh) nổi tiếng với hệ thống bậc đá cổ qua rừng trúc, suối Giải Oan, chùa Hoa Yên và đỉnh chùa Đồng ở độ cao ~1.068m. Đường leo dốc và độ ẩm cao, rất hợp đi trong ngày hoặc kết hợp cáp treo.',
+    'Tà Xùa':
+      '**Tà Xùa** (Bắc Yên, Sơn La) nổi bật với sống lưng khủng long, biển mây vào sáng sớm, đồi gió và khí hậu vùng núi cao se lạnh, thích hợp săn mây kết hợp cắm trại hoặc trekking.',
+    'Hồ Đồng Đò':
+      '**Hồ Đồng Đò** (Sóc Sơn, Hà Nội — cách trung tâm ~45km) có mặt hồ phẳng lặng bao quanh bởi đồi thông, phù hợp cắm trại gia đình, nhóm bạn, chèo SUP và BBQ ngoài trời.',
+    'Núi Hàm Lợn':
+      '**Núi Hàm Lợn** (Sóc Sơn, Hà Nội) có đỉnh cao ~462m cùng hồ Suối Bầu dưới chân núi, rất phổ biến cho người mới tập trekking 1 ngày hoặc cắm trại qua đêm.',
+    'Sa Pa':
+      '**Sa Pa** (Lào Cai) nổi tiếng với khí hậu vùng cao mát lạnh, ruộng bậc thang Mường Hoa, đỉnh Fansipan và các cung trekking bản Cát Cát – Tả Van – Lao Chải.',
+    'Cát Bà':
+      '**Cát Bà** (Hải Phòng) kết hợp trekking rừng quốc gia Kim Giao – đỉnh Ngự Lâm với biển đảo và vịnh Lan Hạ, phù hợp dã ngoại & cắm trại biển.',
+    'Tam Đảo':
+      '**Tam Đảo** (Vĩnh Phúc) cách Hà Nội ~80km, khí hậu mát quanh năm, nổi bật với rừng rậm quốc gia, tháp truyền hình và các cung trek ngắn.',
+    'Đà Lạt':
+      '**Đà Lạt** (Lâm Đồng) nổi bật với rừng thông ôn đới, hồ Tuyền Lâm, đỉnh Langbiang và các cung cắm trại săn mây sáng sớm (nhiệt độ đêm khá lạnh).',
+    'Tà Năng - Phan Dũng':
+      '**Tà Năng - Phan Dũng** là một trong những cung trekking qua rừng thông – đồi cỏ đẹp nhất Việt Nam, nối từ Lâm Đồng xuống Bình Thuận, đòi hỏi chuẩn bị tốt về giày bám, nước uống và dẫn đường.',
+    'Cúc Phương':
+      '**Vườn Quốc gia Cúc Phương** (Ninh Bình) là rừng nguyên sinh cổ thụ lâu đời nhất Việt Nam, nổi bật với động Người Xưa, cây chò chỉ ngàn năm và mùa bướm thường rơi vào khoảng tháng 4–5.',
+  };
+
+  private extractConversationContext(
+    recentMessages: RecentMessageContext[],
+    currentTripState: ValidatedTripState,
+    lastAssistantQuestion?: string | null,
+  ): {
+    lastMentionedDestination: string | null;
+    pendingOwnedQuestionCode: string | null;
+    pendingDecrementItemCode: string | null;
+    pendingFieldQuestion:
+    | 'destination'
+    | 'activity'
+    | 'durationDays'
+    | 'travelers'
+    | null;
+  } {
+    let lastMentionedDestination: string | null =
+      currentTripState.destination || null;
+
+    // Scan from newest to oldest to find the most recently discussed destination (including QA-only turns)
+    for (let i = recentMessages.length - 1; i >= 0; i -= 1) {
+      const m = recentMessages[i];
+      if (m.qaSubjectDestination) {
+        lastMentionedDestination = m.qaSubjectDestination;
+        break;
+      }
+      const txt = m.content || '';
+      const matchedKnown = KNOWN_DESTINATIONS.find((d) => d.pattern.test(txt));
+      if (matchedKnown) {
+        lastMentionedDestination = matchedKnown.canonical;
+        break;
+      }
+    }
+
+    const latestAssistantMsg = [...recentMessages]
+      .reverse()
+      .find((m) => m.role === 'assistant');
+    const qContext = `${lastAssistantQuestion || ''}\n${latestAssistantMsg?.content || ''}`;
+
+    let pendingOwnedQuestionCode: string | null = null;
+    const ownedAskMatch = qContext.match(/nhóm đã có bao nhiêu\s+([^?.!\n]+)/i);
+    if (ownedAskMatch?.[1]) {
+      const matchedItems = this.findLexiconItemsInSegment(ownedAskMatch[1]);
+      if (matchedItems[0]) {
+        pendingOwnedQuestionCode = matchedItems[0].code;
+      }
+    }
+
+    let pendingDecrementItemCode: string | null = null;
+    const decAskMatch = qContext.match(
+      /giảm số (?:lượng )?([^?.!\n]+?)\s*(?:cần chuẩn bị|đã có)/i,
+    );
+    if (decAskMatch?.[1]) {
+      const matchedItems = this.findLexiconItemsInSegment(decAskMatch[1]);
+      if (matchedItems[0]) {
+        pendingDecrementItemCode = matchedItems[0].code;
+      }
+    } else if (/giảm số cần chuẩn bị hay giảm số đã có/i.test(qContext)) {
+      const matchedItems = this.findLexiconItemsInSegment(qContext);
+      if (matchedItems[0]) {
+        pendingDecrementItemCode = matchedItems[0].code;
+      }
+    }
+
+    let pendingFieldQuestion:
+      | 'destination'
+      | 'activity'
+      | 'durationDays'
+      | 'travelers'
+      | null = null;
+    if (/bao nhiêu người|mấy người|số lượng thành viên/i.test(qContext)) {
+      pendingFieldQuestion = 'travelers';
+    } else if (/mấy ngày|bao nhiêu ngày|bao lâu/i.test(qContext)) {
+      pendingFieldQuestion = 'durationDays';
+    } else if (/hoạt động|hình thức|trekking.*cắm trại/i.test(qContext)) {
+      pendingFieldQuestion = 'activity';
+    } else if (/địa điểm nào|đi đâu/i.test(qContext)) {
+      pendingFieldQuestion = 'destination';
+    }
+
+    return {
+      lastMentionedDestination,
+      pendingOwnedQuestionCode,
+      pendingDecrementItemCode,
+      pendingFieldQuestion,
+    };
+  }
+
+  private textMentionsExplicitActivity(rawText: string): boolean {
+    const lower = (rawText || '').toLowerCase();
+    return /(?:cắm\s*trại\s*biển|\bbeach\s*camping\b|\btrekking\b|\btrek\b|đi\s*bộ\s*đường\s*dài|leo\s*núi|\bcamping\b|cắm\s*trại|dã\s*ngoại|phượt\s*xe\s*máy|chạy\s*xe\s*máy|\bmotorbike\b|\bbackpacking\b|đi\s*phượt|tham\s*quan|du\s*lịch\s*nghỉ\s*dưỡng)/i.test(
+      lower,
+    );
+  }
+
+  private buildRetryNoticeForCode(code: AiErrorCode, modelName: string): string {
+    switch (code) {
+      case 'NOT_FOUND':
+        return `Mô hình Gemini (${modelName}) hiện trả về lỗi không tìm thấy (404). Trạng thái chuyến đi và checklist của bạn vẫn được giữ nguyên; vui lòng kiểm tra cấu hình model hoặc thử lại sau.`;
+      case 'QUOTA_EXCEEDED':
+        return 'Gemini API tạm thời vượt hạn mức (Quota 429). Trạng thái chuyến đi và checklist của bạn đã được bảo toàn, bạn hãy thử gửi lại sau ít phút nhé.';
+      case 'TIMEOUT':
+        return 'Gemini API phản hồi quá thời gian chờ (Timeout). Trạng thái chuyến đi và checklist của bạn vẫn an toàn, bạn vui lòng thử gửi lại nhé.';
+      case 'INVALID_SCHEMA':
+        return 'Phản hồi từ mô hình AI tạm chưa đúng định dạng dữ liệu mong muốn. Dữ liệu đã lưu không bị thay đổi, bạn hãy thử diễn đạt lại ngắn gọn hơn.';
+      default:
+        return 'Kết nối tới trợ lý AI tạm gián đoạn. Dữ liệu chuyến đi và checklist của bạn vẫn được bảo toàn, vui lòng thử lại sau ít giây.';
+    }
+  }
+
+  private buildLocalGeneralQaAnswer(userMessage: string): string | null {
+    const lower = (userMessage || '').toLowerCase();
+
+    if (/balo\s*trekking.*(?:khác|so\s*với).*balo\s*thường|balo\s*thường.*balo\s*trekking/i.test(lower)) {
+      return [
+        '**Balo trekking** khác với **balo thông thường** ở 4 điểm chính:',
+        '- **Khung trợ lực & đai trợ lực hông/ngực:** Phân bổ 60–70% trọng lượng xuống hông thay vì dồn hết lên vai khi đi đường dài.',
+        '- **Dung tích & chia ngăn:** Thường từ 30L–65L với khoang đứng dài, ngăn túi ngủ dưới đáy và điểm móc gậy/tấm thảm bên ngoài.',
+        '- **Thoáng lưng & chống thấm:** Lưng lưới thoáng khí giảm mồ hôi và thường kèm áo trùm mưa (rain cover).',
+        '- **Balo thường** phù hợp đi làm, đi học hoặc dạo phố ngắn ngày nhờ gọn nhẹ, nhưng dễ gây đau vai khi mang nặng >6–7 kg trên đường dốc.',
+      ].join('\n');
+    }
+
+    if (/(?:cách|làm\s*sao|hướng\s*dẫn).*(?:thêm|bớt|sửa|xóa|tạo|cập\s*nhật).*(?:checklist|balo|lều|ghế|đồ)/i.test(lower)) {
+      return [
+        'Bạn có thể cập nhật checklist ngay trong khung chat bằng các câu tự nhiên (hoặc chỉnh trực tiếp ở bảng Checklist bên phải):',
+        '- **Cập nhật số đồ đã có:** `"Nhóm đã có 2 balo"`, `"Nhóm có thêm 2 balo rồi"`',
+        '- **Đổi số lượng cần chuẩn bị:** `"Balo mình muốn 3 cái"`, `"Tăng số lượng balo lên là 3"`, `"Thêm 1 tấm bạt"`',
+        '- **Bỏ một món khỏi danh sách:** `"Bỏ ghế xếp khỏi checklist"`, hoặc `"Cho tôi xem checklist"` để kiểm tra lại toàn bộ.',
+      ].join('\n');
+    }
+
+    return null;
+  }
+
+  private buildLocalItineraryAdvice(
+    userMessage: string,
+    currentTripState: ValidatedTripState,
+  ): string | null {
+    const matchedKnown = KNOWN_DESTINATIONS.find((d) => d.pattern.test(userMessage));
+    const dest = matchedKnown?.canonical || currentTripState.destination;
+    if (!dest) return null;
+
+    const daysMatch = userMessage.match(/(\d{1,2})\s*ngày/i);
+    const days = daysMatch?.[1]
+      ? parseInt(daysMatch[1], 10)
+      : currentTripState.durationDays || 2;
+
+    if (dest === 'Vườn Quốc gia Ba Vì') {
+      return days <= 1
+        ? `**Gợi ý lịch trình tham khảo 1 ngày tại Vườn Quốc gia Ba Vì:**\n- **Sáng:** Xuất phát sớm từ Hà Nội → cổng VQG → dừng chân đồi thông cốt 400m chụp ảnh và nghỉ ngơi.\n- **Trưa:** Ăn trưa mang theo hoặc khu dịch vụ cốt 400m/600m.\n- **Chiều:** Tham quan Nhà thờ cổ rêu phong → lên cốt 1100m (Đền Thượng / Đỉnh Vua nếu còn thời gian) rồi quay về trước tối.`
+        : `**Gợi ý lịch trình tham khảo ${days} ngày tại Vườn Quốc gia Ba Vì:**\n- **Ngày 1:** Di chuyển tới Ba Vì → check-in điểm dừng/bãi cắm trại khu cốt 400m → dạo rừng thông, tham quan Nhà thờ cổ rêu phong → tối ăn uống & nghỉ ngơi.\n- **Ngày 2:** Sáng sớm lên khu cốt 1100m săn mây, tham quan Đền Thượng / Đỉnh Vua → ghé vườn xương rồng trước khi xuống núi chiều về.`;
+    }
+
+    return `**Gợi ý khung lịch trình tham khảo ${days} ngày tại ${dest}:**\n- **Ngày 1:** Di chuyển đến ${dest}, làm thủ tục vào khu vực tham quan/điểm trại, dạo các điểm chính quanh khu trung tâm và chuẩn bị đồ cho buổi chiều tối.\n- **Ngày ${days}:** Sáng sớm ngắm cảnh/tham quan điểm cao hoặc tuyến phụ phù hợp thể lực rồi thu dọn đồ quay về trong chiều.`;
+  }
+
+  private async resolveGeneralOrItineraryAnswer(
+    actionType: 'GENERAL_QA' | 'ITINERARY_ADVICE',
+    userMessage: string,
+    currentTripState: ValidatedTripState,
+    modelName: string,
+    recentMessages: RecentMessageContext[],
+    existingFailureCode?: AiErrorCode,
+  ): Promise<{
+    answer: string | null;
+    qaSource: 'GEMINI' | 'LOCAL_KNOWLEDGE' | 'NONE';
+    providerFailureCode?: AiErrorCode;
+    providerFailureNote?: string;
+  }> {
+    if (actionType === 'GENERAL_QA') {
+      const localFaq = this.buildLocalGeneralQaAnswer(userMessage);
+      if (localFaq) {
+        return {
+          answer: localFaq,
+          qaSource: 'LOCAL_KNOWLEDGE',
+        };
+      }
+    }
+
+    if (!existingFailureCode && (this.customQaGenerator || (!this.customGenerator && this.hasGeminiApiKey()))) {
+      const historyLines = recentMessages
+        .slice(-6)
+        .map(
+          (m) =>
+            `${m.role === 'user' ? 'Người dùng' : 'Trợ lý'}: ${String(m.content || '').slice(0, 220)}`,
+        )
+        .join('\n');
+
+      const prompt = [
+        'Bạn là Trợ lý Du lịch & Dã ngoại TravelShare Việt Nam.',
+        actionType === 'ITINERARY_ADVICE'
+          ? 'Người dùng đang xin gợi ý lịch trình tham khảo. Hãy trả lời lịch trình ngắn gọn theo buổi/ngày bằng tiếng Việt, thực tế, KHÔNG tự bịa giá vé/giờ mở cửa/thời tiết thời gian thực hôm nay.'
+          : 'Người dùng đang hỏi kiến thức chung hoặc cách sử dụng TravelShare. Hãy trả lời tự nhiên, súc tích, thân thiện bằng tiếng Việt như chatbot.',
+        historyLines ? `Lịch sử gần đây:\n${historyLines}` : '',
+        `Ngữ cảnh chuyến đi đang lưu: ${JSON.stringify(currentTripState)}`,
+        `Tin nhắn người dùng: "${userMessage}"`,
+      ]
+        .filter(Boolean)
+        .join('\n');
+
+      try {
+        const qaText = await this.invokeGeminiWithTimeout(prompt, modelName, {
+          step: actionType,
+          generatorOverride: this.customQaGenerator,
+        });
+        const cleaned = (qaText || '').trim();
+        if (cleaned) {
+          return {
+            answer: cleaned,
+            qaSource: 'GEMINI',
+          };
+        }
+      } catch (err: any) {
+        const classified = this.classifyProviderError(err, modelName);
+        this.logger.warn(
+          `[AI][step=${actionType}] model=${modelName} code=${classified.code} httpStatus=${classified.httpStatus ?? 500} fallback=LOCAL_OR_RETRY`,
+        );
+        existingFailureCode = classified.code;
+      }
+    }
+
+    if (actionType === 'ITINERARY_ADVICE') {
+      const localItinerary = this.buildLocalItineraryAdvice(
+        userMessage,
+        currentTripState,
+      );
+      if (localItinerary) {
+        return {
+          answer: localItinerary,
+          qaSource: 'LOCAL_KNOWLEDGE',
+        };
+      }
+    }
+
+    if (existingFailureCode) {
+      return {
+        answer: null,
+        qaSource: 'NONE',
+        providerFailureCode: existingFailureCode,
+        providerFailureNote: this.buildRetryNoticeForCode(
+          existingFailureCode,
+          modelName,
+        ),
+      };
+    }
+
+    return {
+      answer: null,
+      qaSource: 'NONE',
+    };
+  }
+
+  private async resolveDestinationQa(
+    fullMessage: string,
+    qaQuestion: string,
+    subjectDestination: string | null,
+    currentTripState: ValidatedTripState,
+    modelName: string,
+    precomputedGeminiAnswer?: string | null,
+  ): Promise<{
+    answer: string;
+    qaSource: 'GEMINI' | 'LOCAL_KNOWLEDGE';
+    needsLiveDisclaimer: boolean;
+    abortedOnTimeout: boolean;
+  }> {
+    const asksRealtime =
+      /(hôm\s+nay|bây\s+giờ|hiện\s+tại|tuần\s+này|cuối\s+tuần\s+này|giá\s+vé\s+mới|mấy\s+giờ\s+mở|thời\s+tiết\s+hôm|dự\s+báo\s+thời\s+tiết|đường\s+có\s+sạt|có\s+mở\s+cửa\s+không)/i.test(
+        qaQuestion,
+      );
+
+    if (!subjectDestination) {
+      return {
+        answer:
+          'Mình chưa thấy điểm đến nào được nhắc tới trong cuộc hội thoại gần đây. Bạn muốn mình giới thiệu địa điểm nào?',
+        qaSource: 'LOCAL_KNOWLEDGE',
+        needsLiveDisclaimer: false,
+        abortedOnTimeout: false,
+      };
+    }
+
+    if (precomputedGeminiAnswer && !this.customQaGenerator) {
+      return {
+        answer: precomputedGeminiAnswer,
+        qaSource: 'GEMINI',
+        needsLiveDisclaimer: asksRealtime,
+        abortedOnTimeout: false,
+      };
+    }
+
+    const activeQaGen = this.customQaGenerator;
+    if (activeQaGen || (!this.customGenerator && this.hasGeminiApiKey())) {
+      const qaPrompt = [
+        'Bạn là Trợ lý Du lịch & Cắm trại TravelShare Việt Nam.',
+        `Địa điểm đang hỏi (đã chuẩn hóa từ ngữ cảnh nếu người dùng nói "ở đó"): ${subjectDestination}.`,
+        `Thông tin chuyến đi hiện tại của người dùng: ${JSON.stringify(currentTripState)}.`,
+        `Câu hỏi điểm đến của người dùng: "${qaQuestion}" (từ tin nhắn: "${fullMessage}").`,
+        'Yêu cầu trả lời:',
+        '1. Trả lời ngắn gọn, tự nhiên, súc tích, đúng trọng tâm bằng tiếng Việt (tối đa 4-5 câu).',
+        '2. Tuyệt đối KHÔNG tự bịa số liệu thay đổi theo thời gian (giá vé hôm nay, giờ mở cửa hôm nay, thời tiết hiện tại) khi không có nguồn cập nhật. Nếu người dùng hỏi thông tin thay đổi theo thời gian, hãy nêu rõ bạn chưa có dữ liệu cập nhật trực tiếp và khuyên kiểm tra kênh chính thức.',
+      ].join('\n');
+
+      try {
+        const qaText = await this.invokeGeminiWithTimeout(qaPrompt, modelName, {
+          step: 'DESTINATION_QA',
+          generatorOverride: activeQaGen,
+        });
+        const cleaned = (qaText || '').trim();
+        if (cleaned.length > 0) {
+          return {
+            answer: cleaned,
+            qaSource: 'GEMINI',
+            needsLiveDisclaimer: asksRealtime,
+            abortedOnTimeout: false,
+          };
+        }
+      } catch (err: any) {
+        const classified = this.classifyProviderError(err, modelName);
+        this.logger.warn(
+          `[AI][step=DESTINATION_QA] model=${modelName} code=${classified.code} fallback=LOCAL_KNOWLEDGE`,
+        );
+        const guide = this.buildLocalDestinationQaAnswer(
+          subjectDestination,
+          qaQuestion,
+          asksRealtime,
+          `Không thể kết nối Gemini (${classified.code}) nên dùng thông tin tham khảo tĩnh`,
+        );
+        return {
+          answer: guide,
+          qaSource: 'LOCAL_KNOWLEDGE',
+          needsLiveDisclaimer: asksRealtime,
+          abortedOnTimeout: classified.code === 'TIMEOUT',
+        };
+      }
+    }
+
+    return {
+      answer: this.buildLocalDestinationQaAnswer(
+        subjectDestination,
+        qaQuestion,
+        asksRealtime,
+      ),
+      qaSource: 'LOCAL_KNOWLEDGE',
+      needsLiveDisclaimer: asksRealtime,
+      abortedOnTimeout: false,
+    };
+  }
+
+  private buildLocalDestinationQaAnswer(
+    destination: string,
+    qaQuestion: string,
+    asksRealtime: boolean,
+    fallbackPrefix?: string,
+  ): string {
+    const baseInfo = TripRequirementParser.DESTINATION_GUIDE_VI[destination];
+    const parts: string[] = [];
+
+    if (baseInfo) {
+      parts.push(baseInfo);
+      if (/nổi\s*bật|có\s*gì\s*(?:hay|chơi|đẹp|đáng)/i.test(qaQuestion)) {
+        if (destination === 'Vườn Quốc gia Ba Vì') {
+          parts.push(
+            'Điểm nổi bật tại Ba Vì gồm săn mây buổi sáng quanh cốt 1100m – Đỉnh Vua, chụp ảnh Nhà thờ cổ phủ rêu, dạo đồi thông cốt 400m và tổ chức dã ngoại/cắm trại dưới tán rừng.',
+          );
+        } else if (destination === 'Yên Tử') {
+          parts.push(
+            'Điểm nổi bật tại Yên Tử là hệ thống bậc đá cổ qua rừng trúc, suối Giải Oan, chùa Hoa Yên và chùa Đồng trên đỉnh núi.',
+          );
+        }
+      }
+    } else {
+      parts.push(
+        `Hiện kho thông tin ngoại tuyến chưa có mô tả chi tiết cho **${destination}** và trợ lý chưa kết nối nguồn tra cứu trực tiếp.`,
+      );
+    }
+
+    if (asksRealtime) {
+      const reason =
+        fallbackPrefix ||
+        'Hệ thống hiện trả lời từ thông tin tham khảo tổng quan, chưa kết nối nguồn cập nhật trực tiếp theo thời gian thực';
+      parts.push(
+        `⚠️ *Lưu ý:* ${reason} nên chưa có giá vé mới nhất, giờ mở cửa hay dự báo thời tiết hôm nay tại ${destination}. Bạn nên kiểm tra thông báo từ ban quản lý khu du lịch trước khi xuất phát.`,
+      );
+    } else if (!baseInfo && fallbackPrefix) {
+      parts.push(`ℹ️ *Lưu ý:* ${fallbackPrefix}.`);
+    }
+
+    return parts.join('\n\n');
+  }
+
+  /**
+   * Split latest turn into semantic clauses so multi-intent messages
+   * (e.g. "Giới thiệu Ba Vì và ghế xếp đã có 2 cáu" or "Ở đó có gì nổi bật? Nhóm đã có 1 lều")
+   * classify each part accurately without QA polluting tripState or checklistVersion.
+   */
+  private analyzeTurnClauses(
+    rawText: string,
+    currentTripState: ValidatedTripState,
+    convContext?: {
+      lastMentionedDestination?: string | null;
+      pendingOwnedQuestionCode?: string | null;
+      pendingDecrementItemCode?: string | null;
+      pendingFieldQuestion?: string | null;
+    },
+  ): {
+    planningText: string;
+    qaClauses: string[];
+    qaSubjectDestination: string | null;
+    readChecklistCodes: string[];
+    requestChecklistPrint: boolean;
+    requestChecklistCreate: boolean;
+    turnActions: TurnActionType[];
+  } {
+    const normalizedText = (rawText || '').trim();
+    if (!normalizedText) {
+      return {
+        planningText: '',
+        qaClauses: [],
+        qaSubjectDestination: null,
+        readChecklistCodes: [],
+        requestChecklistPrint: false,
+        requestChecklistCreate: false,
+        turnActions: [],
+      };
+    }
+
+    const roughSegments = normalizedText
+      .split(/(?:\r?\n|(?<!\d)\.(?!\d)|[;?!])+/)
+      .flatMap((sent) =>
+        sent
+          .split(
+            /\s*,\s*|\s+(?:nhưng|tuy\s+nhiên)\s+|\s+(?:và|với|còn|nhân tiện|ngoài ra|à)\s+(?=(?:giới\s*thiệu|ở\s*(?:đó|đấy)|nơi\s*(?:đó|đấy)|cho\s*(?:tôi\s*|mình\s*)?(?:biết|xem)|xem\s+|in\s+|tạo\s+checklist|lập\s+checklist|còn\s*thiếu|thiếu\s+(?:mấy|bao\s*nhiêu)|hiện\s*có\s+(?:mấy|bao\s*nhiêu)|thêm\s+|bỏ\s+|xóa\s+|tăng\s+|nhóm\s+(?:đã|cần|thiếu)|đã\s*có|có\s*thêm|bớt\s+|giảm\s+|(?:tôi|mình)\s+muốn|nhóm\s+\d|đi\s+\d|cập\s*nhật|(?:ghế|lều|balo|túi\s*ngủ|giày|gậy|áo\s*(?:mưa|khoác)|đèn|bếp|tấm\s*bạt)[^,;]*?(?:đã\s*có|có\s*thêm|cần|thiếu|bớt|muốn|tăng)))/i,
+          )
+          .map((s) => s.trim())
+          .filter(Boolean),
+      )
+      .filter(Boolean);
+
+    const planningClauses: string[] = [];
+    const qaClauses: string[] = [];
+    const readChecklistCodesSet = new Set<string>();
+    let requestChecklistPrint = false;
+    let requestChecklistCreate = false;
+    let sawSmallTalk = false;
+    let sawGeneralQa = false;
+    let sawItineraryAdvice = false;
+    let qaSubjectDestination: string | null = null;
+
+    const findDestinationInText = (s: string): string | null => {
+      for (const item of KNOWN_DESTINATIONS) {
+        if (item.pattern.test(s)) return item.canonical;
+      }
+      return null;
+    };
+
+    for (const clause of roughSegments) {
+      const lowerClause = clause.toLowerCase().trim();
+      if (!lowerClause) continue;
+
+      // 0. Pure greeting / thanks / farewell
+      const isSmallTalkClause =
+        /^(?:(?:dạ|vâng|ừ|ờ|hi|hey|hello|alo|xin\s*chào|chào(?:\s+(?:bạn|ad|admin|shop|bot|trợ\s*lý|em|anh|chị))?|cảm\s*ơn(?:\s+(?:bạn|nhiều|ad|admin|bot|trợ\s*lý))?|thanks?(?:\s+you)?|ok(?:ie)?(?:\s+(?:bạn|nhé|nha|ạ))?|tạm\s*biệt|bye)(?:\s+(?:bạn|nhé|nha|ạ|nhiều))?)$/i.test(
+          lowerClause,
+        );
+      if (isSmallTalkClause) {
+        sawSmallTalk = true;
+        continue;
+      }
+
+      // 1. Explicit CHECKLIST_VIEW ("xem checklist", "in checklist", "cho xem toàn bộ danh sách")
+      const isChecklistView =
+        /(xem|in|hiển\s*thị|cho\s*(?:mình\s*|tôi\s*)?xem|liệt\s*kê)\s+(?:toàn\s*bộ\s+|lại\s+)?(?:checklist|danh\s*sách(?:\s*đồ)?)/i.test(
+          lowerClause,
+        );
+      if (isChecklistView) {
+        requestChecklistPrint = true;
+        continue;
+      }
+
+      // 1b. Explicit CHECKLIST_CREATE ("Tạo checklist", "Lập checklist giúp tôi")
+      const isChecklistCreate =
+        /^(?:hãy\s+)?(?:tạo|lập|lên)\s+(?:giúp\s+(?:mình\s*|tôi\s*)?|ngay\s+)?(?:checklist|danh\s*sách(?:\s*đồ)?)(?:\s+(?:cho\s+(?:chuyến\s*đi|nhóm|tôi|mình)|nhé|đi|nào))?$/i.test(
+          lowerClause,
+        );
+      if (isChecklistCreate) {
+        requestChecklistCreate = true;
+        continue;
+      }
+
+      // 2. Explicit CHECKLIST_ITEM_READ ("Còn thiếu mấy lều?", "Thiếu bao nhiêu ghế xếp?", "Hiện đã có mấy lều?")
+      const mentionedItems = this.findLexiconItemsInSegment(clause);
+      const hasQuestionQtyCue =
+        /(?:mấy|bao\s*nhiêu|bnh|còn\s*bao|đủ\s*chưa)/i.test(lowerClause);
+      const hasDigitOrNumWordForGear =
+        this.parseQuantityFromSegment(clause) !== null;
+      const isItemReadQuery =
+        mentionedItems.length > 0 &&
+        hasQuestionQtyCue &&
+        !hasDigitOrNumWordForGear &&
+        !/(?:nhóm|mình|đoàn)\s+(?:muốn\s+)?(?:thêm|bỏ|xóa|đổi)/i.test(
+          lowerClause,
+        );
+
+      if (isItemReadQuery) {
+        for (const it of mentionedItems) {
+          readChecklistCodesSet.add(it.code);
+        }
+        continue;
+      }
+
+      // 2b. ITINERARY_ADVICE ("Lập lịch trình tham quan Ba Vì 2 ngày")
+      const isItineraryRequest =
+        /(?:lập|lên|gợi\s*ý|tư\s*vấn|xin|viết|làm)\s+(?:giúp\s+(?:mình\s*|tôi\s*)?)?lịch\s*trình|^lịch\s*trình\b/i.test(
+          lowerClause,
+        );
+      const hasActiveTripDeclaration =
+        /(?:tôi|nhóm|đoàn|mình|chúng\s*tôi|chúng\s*mình|bạn)\s+(?:muốn\s+đi|dự\s+định\s+đi|sẽ\s+đi|chốt\s+đi|định\s+đi|lên\s+kế\s+hoạch|cần\s+thuê|muốn\s+thuê)|lập\s+kế\s+hoạch\s+(?:đi|cắm\s*trại|trekking|tham\s*quan)|(?:\d+|một|hai|ba|bốn|năm|sáu|bảy|tám|chín|mười)\s*(?:ngày|người|thành\s*viên)|\b\d{1,2}[/-]\d{1,2}\b|\b(?:ngân\s*sách|triệu|củ|nghìn|ngàn)\b/i.test(
+          lowerClause,
+        );
+      const hasChecklistOpVerb =
+        /(?:đã\s*có|có\s*thêm|bớt|giảm|thêm\s+\d|thêm\s+.*\s+vào|bỏ\s+.*\s+khỏi|xóa\s+.*\s+khỏi|nhóm\s+cần|nhóm\s+thiếu|còn\s+thiếu\s+\d|tăng\s+(?:số\s*(?:lượng)?\s*)?.*?(?:lên|thành)|chỉ\s*(?:dùng|cần)|thì\s+có\s+\d|muốn\s+\d+\s*(?:cái|chiếc|lều|balo|ghế))/i.test(
+          lowerClause,
+        );
+
+      if (isItineraryRequest) {
+        sawItineraryAdvice = true;
+        if (
+          findDestinationInText(clause) ||
+          this.textMentionsExplicitActivity(clause) ||
+          hasActiveTripDeclaration
+        ) {
+          planningClauses.push(clause);
+        }
+        continue;
+      }
+
+      // 2c. GENERAL_QA (how-to questions, gear comparison, conceptual questions)
+      const isHowToQuestion =
+        /(?:cách|làm\s*sao|hướng\s*dẫn)\s+(?:để\s+)?(?:thêm|bớt|sửa|xóa|tạo|cập\s*nhật|thuê|đặt|dùng|chuẩn\s*bị)/i.test(
+          lowerClause,
+        );
+      const isConceptualComparisonQa =
+        /(?:khác(?:\s+nhau|\s+với|\s+[^?]{1,40})?\s+(?:thế\s*nào|gì|ra\s*sao|ở\s*điểm\s*nào|như\s*nào)|so\s*sánh|nên\s*chọn\s+.*\s+hay|ưu\s*(?:nhược)?\s*điểm|tại\s*sao|là\s+gì\??$)/i.test(
+          lowerClause,
+        );
+      if (
+        (isHowToQuestion || isConceptualComparisonQa) &&
+        !hasActiveTripDeclaration
+      ) {
+        sawGeneralQa = true;
+        continue;
+      }
+
+      // 3. Explicit DESTINATION_QA ("Giới thiệu ngắn gọn về Ba Vì", "Ở đó có gì nổi bật?")
+      const hasQaPhrase =
+        /(?:giới\s*thiệu|tổng\s*quan|review|thông\s*tin\s+về|cho\s*biết\s+về|nói\s*(?:thêm\s+)?về|mô\s*tả|đặc\s*điểm|kinh\s*nghiệm\s+đi|có\s+gì\s+(?:nổi\s*bật|hay|chơi|đẹp|đáng|lưu\s*ý|đặc\s*sắc)|nổi\s*bật\s+(?:gì|nào)|điểm\s+nổi\s*bật|cảnh\s+đẹp|thời\s*tiết|khí\s*hậu|đường\s*đi|bao\s*xa|mất\s*bao\s*lâu|giá\s*vé|vé\s*vào\s*cửa|giờ\s*mở\s*cửa|ở\s*(?:đó|đấy)\s+(?:thế\s*nào|ra\s*sao|có\s*gì))/i.test(
+          lowerClause,
+        );
+
+      if (hasQaPhrase && !hasActiveTripDeclaration && !hasChecklistOpVerb) {
+        qaClauses.push(clause);
+        const namedDest = findDestinationInText(clause);
+        if (namedDest) {
+          qaSubjectDestination = namedDest;
+        } else if (
+          /(?:ở\s*(?:đó|đấy)|nơi\s*(?:đó|đấy)|chỗ\s*(?:đó|đấy)|địa\s*điểm\s*(?:đó|này)|khu\s*(?:đó|này)|trên\s*(?:đó|đấy))/i.test(
+            lowerClause,
+          ) ||
+          !namedDest
+        ) {
+          if (!qaSubjectDestination) {
+            qaSubjectDestination =
+              convContext?.lastMentionedDestination ||
+              currentTripState.destination ||
+              null;
+          }
+        }
+        continue;
+      }
+
+      planningClauses.push(clause);
+    }
+
+    const turnActions: TurnActionType[] = [];
+    if (
+      sawSmallTalk &&
+      planningClauses.length === 0 &&
+      qaClauses.length === 0 &&
+      !requestChecklistPrint &&
+      !requestChecklistCreate &&
+      readChecklistCodesSet.size === 0 &&
+      !sawGeneralQa &&
+      !sawItineraryAdvice
+    ) {
+      turnActions.push('SMALL_TALK');
+    }
+    if (sawGeneralQa) turnActions.push('GENERAL_QA');
+    if (sawItineraryAdvice) turnActions.push('ITINERARY_ADVICE');
+    if (qaClauses.length > 0) turnActions.push('DESTINATION_QA');
+    if (readChecklistCodesSet.size > 0) turnActions.push('CHECKLIST_ITEM_READ');
+    if (requestChecklistPrint) turnActions.push('CHECKLIST_VIEW');
+    if (requestChecklistCreate) turnActions.push('CHECKLIST_CREATE');
+
+    return {
+      planningText: planningClauses.join(', '),
+      qaClauses,
+      qaSubjectDestination,
+      readChecklistCodes: Array.from(readChecklistCodesSet),
+      requestChecklistPrint,
+      requestChecklistCreate,
+      turnActions,
     };
   }
 
@@ -705,14 +1902,42 @@ export class TripRequirementParser {
     rawText: string,
     currentTripState: ValidatedTripState,
     referenceDate?: Date,
+    convContext?: {
+      lastMentionedDestination?: string | null;
+      pendingOwnedQuestionCode?: string | null;
+      pendingDecrementItemCode?: string | null;
+      pendingFieldQuestion?: string | null;
+    },
   ): Omit<ExtractedTripPatch, 'providerMeta'> {
-    const text = (rawText || '').trim();
+    const analyzed = this.analyzeTurnClauses(
+      rawText,
+      currentTripState,
+      convContext,
+    );
+    const text = analyzed.planningText.trim();
     const lower = text.toLowerCase();
 
     const updatedFields: Partial<ValidatedTripState> = {};
     const clearedFields: Array<keyof ValidatedTripState> = [];
     let ownedGearMode: 'ADD' | 'REPLACE' | 'CLEAR' | undefined;
     let ambiguousDateNote: string | null = null;
+
+    if (!text) {
+      return {
+        updatedFields,
+        clearedFields,
+        ownedGearMode,
+        checklistOperations: [],
+        turnActions: analyzed.turnActions,
+        qaQuestion:
+          analyzed.qaClauses.length > 0 ? analyzed.qaClauses.join('. ') : null,
+        qaSubjectDestination: analyzed.qaSubjectDestination,
+        readChecklistCodes: analyzed.readChecklistCodes,
+        requestChecklistPrint: analyzed.requestChecklistPrint,
+        requestChecklistCreate: analyzed.requestChecklistCreate,
+        ambiguousDateNote: null,
+      };
+    }
 
     // 1. Detect explicit clear/delete requests ("xóa ngân sách", "bỏ ngày đi", "chưa chốt ngày", "không có đồ sẵn")
     if (
@@ -748,7 +1973,7 @@ export class TripRequirementParser {
       ownedGearMode = 'CLEAR';
     }
 
-    // 2. Detect Activity
+    // 2. Detect Activity (explicit only — never default to TREKKING)
     if (/cắm\s*trại\s*biển|\bbeach\s*camping\b/i.test(lower)) {
       updatedFields.activity = ActivityType.BEACH_CAMPING;
     } else if (/\btrekking\b|\btrek\b|đi\s*bộ\s*đường\s*dài|leo\s*núi/i.test(lower)) {
@@ -759,23 +1984,39 @@ export class TripRequirementParser {
       updatedFields.activity = ActivityType.MOTORBIKE_TOUR;
     } else if (/\bbackpacking\b|đi\s*phượt/i.test(lower)) {
       updatedFields.activity = ActivityType.BACKPACKING;
+    } else if (/tham\s*quan|du\s*lịch\s*nghỉ\s*dưỡng|nghỉ\s*ngơi/i.test(lower)) {
+      updatedFields.activity = ActivityType.OTHER;
     }
 
-    // 3. Detect Destination
+    // 3. Detect Destination (including coreference "ở đó" / "ở đấy" / "nơi đó")
     for (const item of KNOWN_DESTINATIONS) {
       if (item.pattern.test(text)) {
         updatedFields.destination = item.canonical;
         break;
       }
     }
+    if (
+      !updatedFields.destination &&
+      /(?:muốn\s+đi|đi|chọn|tới|đến|về|lập\s+kế\s+hoạch(?:\s+đi)?)\s+(?:ở\s*(?:đó|đấy)|nơi\s*(?:đó|đấy)|chỗ\s*(?:đó|đấy)|địa\s*điểm\s*(?:đó|này))/i.test(
+        lower,
+      )
+    ) {
+      const resolvedDest =
+        analyzed.qaSubjectDestination ||
+        convContext?.lastMentionedDestination ||
+        currentTripState.destination;
+      if (resolvedDest) {
+        updatedFields.destination = resolvedDest;
+      }
+    }
     if (!updatedFields.destination) {
       const customDestMatch = text.match(
-        /(?:trekking|camping|cắm\s+trại|leo\s+núi|đi\s+phượt|đến|tới|tại)\s+([A-ZÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴÈÉẸẺẼÊỀẾỆỂỄÌÍỊỈĨÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠÙÚỤỦŨƯỪỨỰỬỮỲÝỴỶỸĐ][\p{L}\s-]{1,30})/u,
+        /(?:trekking|camping|cắm\s+trại|tham\s+quan|leo\s+núi|đi\s+phượt|đến|tới|tại)\s+([A-ZÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴÈÉẸẺẼÊỀẾỆỂỄÌÍỊỈĨÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠÙÚỤỦŨƯỪỨỰỬỮỲÝỴỶỸĐ][\p{L}\s-]{1,30})/u,
       );
       if (customDestMatch?.[1]) {
         const cleaned = customDestMatch[1]
           .replace(
-            /\s+(ngày|vào|đi|nhóm|một|hai|ba|bốn|năm|cuối\s+tuần|tháng).*$/i,
+            /\s+(ngày|vào|đi|nhóm|một|hai|ba|bốn|năm|cuối\s+tuần|tháng|cho).*$/i,
             '',
           )
           .trim();
@@ -785,8 +2026,23 @@ export class TripRequirementParser {
       }
     }
 
-    // 4. Detect Intent & Rental desire
-    if (/(thuê|mượn|tìm\s+đồ\s+thuê|cần\s+thuê)/i.test(lower)) {
+    // 4. Detect Intent, Rental desire & Preliminary gear tip requests
+    const isPolicyOrSupportQuestion =
+      /(chính\s*sách|hoàn\s*tiền|quy\s*định|bảo\s*hiểm|điều\s*khoản|hỗ\s*trợ|ra\s*sao\??$|như\s+thế\s+nào\??$)/i.test(
+        lower,
+      ) && !/(muốn\s+thuê|cần\s+thuê|tìm\s+đồ\s+thuê|đặt\s+thuê|ngân\s*sách)/i.test(lower);
+
+    const asksPreliminaryGearTip =
+      /(?:cần\s*(?:chuẩn\s*bị|mang)(?:\s+theo)?\s+gì|mang\s+gì|đem\s+gì|nên\s+mang\s+gì|chuẩn\s*bị\s+(?:đồ\s+)?gì)/i.test(
+        lower,
+      );
+
+    if (
+      !isPolicyOrSupportQuestion &&
+      /(cần\s+thuê|muốn\s+thuê|tìm\s+đồ\s+thuê|thuê\s+đồ|mượn\s+đồ|mượn\s+thêm|\bthuê\b)/i.test(
+        lower,
+      )
+    ) {
       updatedFields.wantsToRent = true;
       if (!currentTripState.intent) {
         updatedFields.intent = 'PREPARE_TRIP';
@@ -794,7 +2050,9 @@ export class TripRequirementParser {
     } else if (
       updatedFields.destination ||
       updatedFields.activity ||
-      /(chuẩn\s+bị|tư\s+vấn|checklist|lên\s+đồ|muốn\s+đi)/i.test(lower)
+      /(chuẩn\s+bị|tư\s+vấn|checklist|lên\s+đồ|muốn\s+đi|lập\s+kế\s+hoạch|cần\s+mang\s+gì)/i.test(
+        lower,
+      )
     ) {
       updatedFields.intent = currentTripState.intent || 'PREPARE_TRIP';
     }
@@ -1020,11 +2278,77 @@ export class TripRequirementParser {
       }
     }
 
+    const bareNumericMatch = text.match(/^\s*(\d{1,3})\s*$/);
+    if (bareNumericMatch?.[1]) {
+      const bareNum = parseInt(bareNumericMatch[1], 10);
+      if (convContext?.pendingFieldQuestion === 'travelers' && bareNum >= 1 && bareNum <= 200) {
+        updatedFields.travelers = bareNum;
+      } else if (convContext?.pendingFieldQuestion === 'durationDays' && bareNum >= 1 && bareNum <= 60) {
+        updatedFields.durationDays = bareNum;
+      } else if (convContext?.pendingOwnedQuestionCode) {
+        const lex = OWNED_GEAR_LEXICON.find(
+          (l) => l.code === convContext.pendingOwnedQuestionCode,
+        );
+        if (lex) {
+          checklistOperations.push({
+            intent: 'SET_OWNED',
+            categoryCode: lex.code,
+            itemName: lex.labelVi,
+            quantity: bareNum,
+            unit: lex.unit,
+            rawClause: text,
+          });
+          updatedFields.ownedGear = [lex.code];
+          ownedGearMode = 'ADD';
+          updatedFields.ownedGearQuantities = { [lex.code]: bareNum };
+        }
+      }
+    }
+
+    let preliminaryGearSuggestion: string | null = null;
+    if (asksPreliminaryGearTip) {
+      const tipDest = updatedFields.destination || currentTripState.destination;
+      const tipAct = updatedFields.activity || currentTripState.activity;
+      if (tipDest === 'Yên Tử' || tipAct === ActivityType.TREKKING) {
+        preliminaryGearSuggestion =
+          'Với hành trình leo núi / tham quan địa hình bậc đá như Yên Tử, bạn nên chuẩn bị sơ bộ: giày bám tốt, balo nhẹ 20–30L, nước uống, áo gió/áo mưa mỏng và gậy leo núi nếu đi bộ toàn tuyến.';
+      } else if (tipAct === ActivityType.CAMPING || tipAct === ActivityType.BEACH_CAMPING) {
+        preliminaryGearSuggestion =
+          'Gợi ý đồ cơ bản cho cắm trại gồm: lều chống mưa, túi ngủ/tấm lót cách nhiệt, đèn pin, ghế xếp, bàn nhỏ và nước uống.';
+      } else {
+        preliminaryGearSuggestion =
+          'Với chuyến đi ngoài trời tại ' +
+          (tipDest || 'điểm đến này') +
+          ', nhóm đồ thiết yếu thường gồm balo gọn nhẹ, giày thể thao/bám tốt, áo khoác mỏng, áo mưa và nước uống.';
+      }
+    }
+
+    const turnActions = [...analyzed.turnActions];
+    if (checklistOperations.length > 0) {
+      turnActions.push('CHECKLIST_MUTATION');
+    }
+    const hasNonGearTripField =
+      Object.keys(updatedFields).some(
+        (k) => k !== 'ownedGear' && k !== 'ownedGearQuantities',
+      ) || clearedFields.length > 0;
+    if (hasNonGearTripField) {
+      turnActions.push('TRIP_UPDATE');
+    }
+
     return {
       updatedFields,
       clearedFields,
       ownedGearMode,
       checklistOperations,
+      turnActions: Array.from(new Set(turnActions)),
+      qaQuestion:
+        analyzed.qaClauses.length > 0 ? analyzed.qaClauses.join('. ') : null,
+      qaSubjectDestination:
+        analyzed.qaSubjectDestination || updatedFields.destination || null,
+      readChecklistCodes: analyzed.readChecklistCodes,
+      requestChecklistPrint: analyzed.requestChecklistPrint,
+      requestChecklistCreate: analyzed.requestChecklistCreate,
+      preliminaryGearSuggestion,
       ambiguousDateNote,
     };
   }
@@ -1062,7 +2386,7 @@ export class TripRequirementParser {
       );
 
     const rawClauses = sanitizedText
-      .split(/[,;\n]+/)
+      .split(/(?:[,;\n?!]|(?<!\d)\.(?!\d)|\s+(?:nhưng|tuy\s+nhiên)\s+)+/i)
       .map((c) => c.trim())
       .filter(Boolean);
 
@@ -1070,6 +2394,23 @@ export class TripRequirementParser {
 
     for (const clause of rawClauses) {
       const lowerClause = clause.toLowerCase();
+
+      // Skip read-only checklist questions ("còn thiếu mấy lều?", "đã có bao nhiêu ghế?")
+      if (
+        /(?:mấy|bao\s*nhiêu|bnh|đủ\s*chưa)/i.test(lowerClause) &&
+        this.parseQuantityFromSegment(clause) === null
+      ) {
+        continue;
+      }
+
+      // Skip how-to / comparison questions ("Cách thêm 1 balo vào checklist?", "Balo trekking khác balo thường thế nào?")
+      if (
+        /(?:cách|làm\s*sao|hướng\s*dẫn)\s+(?:để\s+)?(?:thêm|bớt|sửa|xóa|tạo|cập\s*nhật)|(?:khác(?:\s+nhau)?\s+(?:thế\s*nào|gì|ra\s*sao)|so\s*sánh)/i.test(
+          lowerClause,
+        )
+      ) {
+        continue;
+      }
 
       // 1. Check REMOVE_ITEM: "Bỏ ghế xếp khỏi checklist", "Xóa ghế xếp khỏi danh sách", "Bỏ mục ghế xếp"
       const removeMatch =
@@ -1106,18 +2447,26 @@ export class TripRequirementParser {
         continue;
       }
 
-      // 2. Check ADD_ITEM: "Thêm 1 tấm bạt vào checklist", "Bổ sung 1 tấm bạt vào checklist"
-      const addChecklistMatch = lowerClause.match(
-        /(?:thêm|bổ\s*sung|cho\s*thêm)\s+(.+?)\s+(?:vào|vô|trong)\s+(?:checklist|danh\s*sách)/i,
-      );
-      if (addChecklistMatch) {
-        const innerText = addChecklistMatch[1];
+      // 2. Check ADD / INCREMENT_REQUIRED:
+      // - "Thêm 2 balo" / "Thêm 1 tấm bạt" / "Thêm 1 tấm bạt vào checklist" / "Tăng thêm 2 balo"
+      const addWithOrWithoutChecklistMatch =
+        lowerClause.match(
+          /(?:thêm|bổ\s*sung|cho\s*thêm)\s+(.+?)\s+(?:vào|vô|trong)\s+(?:checklist|danh\s*sách)/i,
+        ) ||
+        (!/(?:có\s+thêm|mượn\s+thêm|tìm\s+thêm|kiếm\s+thêm|mua\s+thêm|bổ\s+sung\s+thêm)/i.test(
+          lowerClause,
+        )
+          ? lowerClause.match(/(?:tăng\s+thêm|thêm|cho\s+thêm|bổ\s+sung)\s+(.+)/i)
+          : null);
+
+      if (addWithOrWithoutChecklistMatch) {
+        const innerText = addWithOrWithoutChecklistMatch[1];
         const qty = this.parseQuantityFromSegment(innerText) ?? 1;
         const matchedItems = this.findLexiconItemsInSegment(innerText);
         if (matchedItems.length > 0) {
           for (const item of matchedItems) {
             operations.push({
-              intent: 'ADD_ITEM',
+              intent: 'INCREMENT_REQUIRED',
               categoryCode: item.code,
               itemName: item.labelVi,
               quantity: qty,
@@ -1125,7 +2474,10 @@ export class TripRequirementParser {
               rawClause: clause,
             });
           }
-        } else {
+          continue;
+        } else if (
+          /(?:vào|vô|trong)\s+(?:checklist|danh\s*sách)/i.test(lowerClause)
+        ) {
           const customName = this.cleanCustomItemName(innerText);
           if (customName) {
             operations.push({
@@ -1137,8 +2489,8 @@ export class TripRequirementParser {
               rawClause: clause,
             });
           }
+          continue;
         }
-        continue;
       }
 
       // Find all gear items mentioned in this clause
@@ -1165,9 +2517,9 @@ export class TripRequirementParser {
           lowerClause,
         );
       const hasRequiredWord =
-        /(?:nhóm\s+cần|đoàn\s+cần|mình\s+cần|cần\s+chuẩn\s+bị|đổi\s+thành\s+cần|sửa\s+thành\s+cần|(?:^|[\s,.;])cần)(?!\s*(?:thuê|mượn|tư\s*vấn|hỏi|bổ\s*sung|thông\s*tin))(?=$|[\s,.;])/i.test(
+        /(?:nhóm\s+cần|đoàn\s+cần|mình\s+cần|cần\s+chuẩn\s*bị|đổi\s+thành\s+cần|sửa\s+thành\s+cần|(?:^|[\s,.;])cần(?!\s*(?:thuê|mượn|tư\s*vấn|hỏi|bổ\s*sung|thông\s*tin|mang\s+gì))(?=$|[\s,.;])|chỉ\s*(?:dùng|cần|lấy|mang)|tăng\s+(?:số\s*(?:lượng)?\s*)?.*?(?:lên(?:\s+là)?|thành)|(?:muốn|chốt|đặt|giữ|thì\s+có)\s+(?:có\s+|dùng\s+|lấy\s+)?(?:\d+|một|hai|ba|bốn|năm|sáu|bảy|tám|chín|mười))/i.test(
           lowerClause,
-        );
+        ) && !/(?:muốn\s+thuê|cần\s+thuê)/i.test(lowerClause);
 
       if (hasDecrementWord) {
         if (hasOwnedQualifier) {

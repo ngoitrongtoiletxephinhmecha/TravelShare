@@ -28,6 +28,14 @@ export interface ValidatedTripState {
   experienceLevel: ExperienceLevel | null;
   ownedGear: string[];
   ownedGearQuantities?: Record<string, number>;
+  requiredGearQuantities?: Record<string, number>;
+  removedGearCodes?: string[];
+  customGearItems?: Array<{
+    categoryCode: string;
+    itemName: string;
+    quantityRequired: number;
+    unit?: string;
+  }>;
   budgetVnd: number | null;
   pickupArea: string | null;
   wantsToRent: boolean;
@@ -184,6 +192,20 @@ export class TravelPlan {
   @Prop({ type: Object, default: {} })
   ownedGearQuantities?: Record<string, number>;
 
+  @Prop({ type: Object, default: {} })
+  requiredGearQuantities?: Record<string, number>;
+
+  @Prop({ type: [String], default: [] })
+  removedGearCodes?: string[];
+
+  @Prop({ type: [Object], default: [] })
+  customGearItems?: Array<{
+    categoryCode: string;
+    itemName: string;
+    quantityRequired: number;
+    unit?: string;
+  }>;
+
   @Prop({ type: Boolean, default: false })
   wantsToRent?: boolean;
 
@@ -259,6 +281,13 @@ export class ChecklistEntry {
 
 export type ChecklistDocument = Checklist & Document;
 
+export interface ChecklistVersionChange {
+  version: number;
+  scope: 'ITEM' | 'GLOBAL';
+  itemKeys?: string[];
+  action?: string;
+}
+
 @Schema({ collection: 'checklists', timestamps: true })
 export class Checklist {
   @Prop({ type: Types.ObjectId, ref: 'User', required: true, index: true })
@@ -284,6 +313,9 @@ export class Checklist {
 
   @Prop({ type: [ChecklistEntry], default: [] })
   items: ChecklistEntry[];
+
+  @Prop({ type: [Object], default: [] })
+  versionHistory?: ChecklistVersionChange[];
 
   createdAt?: Date;
   updatedAt?: Date;

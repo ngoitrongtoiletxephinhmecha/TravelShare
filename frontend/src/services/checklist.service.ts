@@ -200,6 +200,7 @@ export const checklistService = {
       ownedConfirmed?: boolean;
       requiredAttributes?: Record<string, any>;
       note?: string;
+      expectedChecklistVersion?: number;
     },
   ): Promise<ChecklistDetailDto> {
     const res = await apiClient.patch<ApiResponse<ChecklistDetailDto>>(
@@ -218,6 +219,7 @@ export const checklistService = {
       quantityOwned?: number;
       unit?: string;
       canRent?: boolean;
+      expectedChecklistVersion?: number;
     },
   ): Promise<ChecklistDetailDto> {
     const res = await apiClient.post<ApiResponse<ChecklistDetailDto>>(
@@ -230,9 +232,15 @@ export const checklistService = {
   async removeChecklistItem(
     checklistId: string,
     itemId: string,
+    expectedChecklistVersion?: number,
   ): Promise<ChecklistDetailDto> {
     const res = await apiClient.delete<ApiResponse<ChecklistDetailDto>>(
       `/checklists/${checklistId}/items/${encodeURIComponent(itemId)}`,
+      {
+        params: expectedChecklistVersion
+          ? { expectedChecklistVersion }
+          : undefined,
+      },
     );
     return res.data.data;
   },

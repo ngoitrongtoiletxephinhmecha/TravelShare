@@ -24,6 +24,7 @@ import { AdminModule } from './modules/admin/admin.module';
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
+      envFilePath: ['.env', 'backend/.env', '../.env'],
       load: [configuration],
     }),
     ThrottlerModule.forRoot([

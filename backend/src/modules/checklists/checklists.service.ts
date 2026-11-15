@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
@@ -14,6 +15,7 @@ import {
   Checklist,
   ChecklistDocument,
   ChecklistEntry,
+  ChecklistVersionChange,
   GearAvailability,
   GearAvailabilityDocument,
   GearItem,
@@ -334,11 +336,20 @@ export class ChecklistsService {
       travelers: number;
       ownedGearCodes?: string[];
       ownedGearQuantities?: Record<string, number>;
+      requiredGearQuantities?: Record<string, number>;
+      removedGearCodes?: string[];
+      customGearItems?: Array<{
+        categoryCode: string;
+        itemName: string;
+        quantityRequired: number;
+        unit?: string;
+      }>;
     },
     previousItems: ChecklistEntry[] = [],
     options?: {
       removedItemCodes?: string[];
       didTravelersOrDurationChange?: boolean;
+      didTravelersChange?: boolean;
     },
   ): Promise<ChecklistEntry[]> {
     const rawActivity = plan.activity || ActivityType.TREKKING;
@@ -352,18 +363,28 @@ export class ChecklistsService {
       .find({ activity: effectiveActivity })
       .lean();
 
+    const mergedRemoved = Array.from(
+      new Set([
+        ...(options?.removedItemCodes || []),
+        ...(plan.removedGearCodes || []),
+      ]),
+    );
+
     return buildChecklistEntriesFromRules({
       activity: effectiveActivity,
       durationDays: plan.durationDays,
       travelers: plan.travelers,
       ownedGearCodes: plan.ownedGearCodes || [],
       ownedGearQuantities: plan.ownedGearQuantities || {},
+      requiredGearQuantities: plan.requiredGearQuantities || {},
+      customGearItems: plan.customGearItems || [],
       dbRules: dbRules || [],
       previousItems,
-      removedItemCodes: options?.removedItemCodes || [],
+      removedItemCodes: mergedRemoved,
       didTravelersOrDurationChange: Boolean(
         options?.didTravelersOrDurationChange,
       ),
+      didTravelersChange: Boolean(options?.didTravelersChange),
     });
   }
 
@@ -472,19 +493,31 @@ export class ChecklistsService {
         travelers: plan.travelers,
         ownedGearCodes: plan.ownedGearCodes || [],
         ownedGearQuantities: (plan as any).ownedGearQuantities || {},
+        requiredGearQuantities: (plan as any).requiredGearQuantities || {},
+        removedGearCodes: (plan as any).removedGearCodes || [],
+        customGearItems: (plan as any).customGearItems || [],
       },
       existingChecklist?.items || [],
       {
         removedItemCodes,
         didTravelersOrDurationChange: didPlanVersionAdvance,
+        didTravelersChange: false, // Manual overrides stay intact on explicit Tạo/Đồng bộ checklist
       },
     );
 
     const title = `Checklist ${plan.destination || 'Chuyến đi'} (${plan.durationDays} ngày • ${plan.travelers} người)`;
 
     if (existingChecklist) {
-      const nextChecklistVersion =
-        (Number(existingChecklist.checklistVersion) || 1) + 1;
+      const currentVer = Number(existingChecklist.checklistVersion) || 1;
+      const nextChecklistVersion = currentVer + 1;
+      const nextHistory = this.appendChecklistVersionHistory(
+        existingChecklist.versionHistory,
+        {
+          version: nextChecklistVersion,
+          scope: 'GLOBAL',
+          action: 'REGENERATE',
+        },
+      );
       const updated = await this.checklistModel
         .findByIdAndUpdate(
           existingChecklist._id,
@@ -495,6 +528,7 @@ export class ChecklistsService {
               checklistVersion: nextChecklistVersion,
               items: nextItems,
               removedItemCodes,
+              versionHistory: nextHistory,
             },
           },
           { new: true },
@@ -509,6 +543,7 @@ export class ChecklistsService {
           checklistVersion: nextChecklistVersion,
           items: nextItems,
           removedItemCodes,
+          versionHistory: nextHistory,
         },
         plan,
       );
@@ -522,7 +557,9 @@ export class ChecklistsService {
       planVersion: currentPlanVersion,
       checklistVersion: 1,
       items: nextItems,
-      removedItemCodes: [],
+      removedItemCodes: Array.isArray((plan as any).removedGearCodes)
+        ? (plan as any).removedGearCodes
+        : [],
     });
 
     if (plan.aiConversationId) {
@@ -554,6 +591,149 @@ export class ChecklistsService {
     }
 
     return this.formatChecklist(checklist, plan);
+  }
+
+  private appendChecklistVersionHistory(
+    existing: ChecklistVersionChange[] | undefined,
+    entry: ChecklistVersionChange,
+  ): ChecklistVersionChange[] {
+    const base = Array.isArray(existing) ? existing : [];
+    return [...base, entry].slice(-30);
+  }
+
+  private async throwVersionConflict(
+    checklist: any,
+    expectedVersion: number | undefined,
+    message: string,
+  ): Promise<never> {
+    let plan: any = null;
+    if (checklist?.travelPlanId) {
+      plan = await this.travelPlanModel.findById(checklist.travelPlanId).lean();
+    }
+    throw new ConflictException({
+      statusCode: 409,
+      code: 'CHECKLIST_VERSION_CONFLICT',
+      message,
+      expectedChecklistVersion: expectedVersion ?? null,
+      currentChecklistVersion: Number(checklist?.checklistVersion) || 1,
+      checklist: this.formatChecklist(checklist, plan),
+    });
+  }
+
+  /**
+   * Optimistic concurrency control for checklist item mutations across tabs:
+   * - If expectedVersion === currentVersion -> proceed normally
+   * - If expectedVersion < currentVersion -> inspect intermediate `versionHistory`;
+   *   if every intermediate version only touched OTHER items (`scope === 'ITEM'` with disjoint keys),
+   *   allow safe merge onto latest `checklist`; otherwise throw 409 ConflictException asking client to reload.
+   */
+  private async assertOrResolveChecklistConcurrency(
+    checklist: any,
+    expectedVersion: number | undefined,
+    targetItemKeys: string[],
+  ): Promise<number> {
+    const currentVer = Number(checklist.checklistVersion) || 1;
+    if (expectedVersion === undefined || expectedVersion === null) {
+      return currentVer;
+    }
+
+    if (expectedVersion > currentVer) {
+      await this.throwVersionConflict(
+        checklist,
+        expectedVersion,
+        'Phiên bản checklist gửi lên không hợp lệ. Vui lòng tải lại checklist mới nhất.',
+      );
+    }
+
+    if (expectedVersion === currentVer) {
+      return currentVer;
+    }
+
+    const history: ChecklistVersionChange[] = Array.isArray(
+      checklist.versionHistory,
+    )
+      ? checklist.versionHistory
+      : [];
+
+    const normalizedTargets = new Set(
+      targetItemKeys.filter(Boolean).map((k) => String(k).toUpperCase()),
+    );
+
+    for (let v = expectedVersion + 1; v <= currentVer; v++) {
+      const change = history.find((h) => Number(h.version) === v);
+      if (!change || change.scope !== 'ITEM') {
+        await this.throwVersionConflict(
+          checklist,
+          expectedVersion,
+          'Checklist vừa được thay đổi cấu trúc ở một tab hoặc phiên làm việc khác. Vui lòng tải lại checklist mới nhất trước khi tiếp tục.',
+        );
+        return currentVer;
+      }
+      const touched = (change.itemKeys || []).map((k) =>
+        String(k).toUpperCase(),
+      );
+      if (touched.some((k) => normalizedTargets.has(k))) {
+        await this.throwVersionConflict(
+          checklist,
+          expectedVersion,
+          'Hạng mục này vừa được chỉnh sửa ở một tab khác. Vui lòng tải lại checklist mới nhất để tránh ghi đè dữ liệu.',
+        );
+      }
+    }
+
+    // All intermediate versions only updated unrelated items -> safe to merge onto latest snapshot
+    return currentVer;
+  }
+
+  private async atomicSaveChecklistVersion(
+    checklist: any,
+    expectedWriteVersion: number,
+    setPayload: Record<string, any>,
+    strictConcurrency: boolean,
+  ): Promise<any> {
+    const modelAny = this.checklistModel as any;
+    if (typeof modelAny.findOneAndUpdate === 'function') {
+      const updated = await modelAny
+        .findOneAndUpdate(
+          {
+            _id: checklist._id,
+            checklistVersion: expectedWriteVersion,
+          },
+          { $set: setPayload },
+          { new: true },
+        )
+        .lean();
+
+      if (!updated) {
+        const latest =
+          (await this.checklistModel.findById(checklist._id).lean()) ||
+          checklist;
+        await this.throwVersionConflict(
+          latest,
+          expectedWriteVersion,
+          'Checklist vừa được cập nhật đồng thời từ một tab khác. Vui lòng tải lại checklist mới nhất.',
+        );
+      }
+      return updated;
+    }
+
+    if (strictConcurrency) {
+      const latest = await this.checklistModel.findById(checklist._id).lean();
+      if (
+        !latest ||
+        (Number(latest.checklistVersion) || 1) !== expectedWriteVersion
+      ) {
+        await this.throwVersionConflict(
+          latest || checklist,
+          expectedWriteVersion,
+          'Checklist vừa được cập nhật đồng thời từ một tab khác. Vui lòng tải lại checklist mới nhất.',
+        );
+      }
+    }
+
+    return await this.checklistModel
+      .findByIdAndUpdate(checklist._id, { $set: setPayload }, { new: true })
+      .lean();
   }
 
   /**
@@ -616,6 +796,11 @@ export class ChecklistsService {
     }
 
     const target = items[idx];
+    const currentWriteVersion = await this.assertOrResolveChecklistConcurrency(
+      checklist,
+      dto.expectedChecklistVersion,
+      [target.itemId, target.categoryCode],
+    );
     let nextItems = items;
     let removedItemCodes: string[] = Array.isArray(checklist.removedItemCodes)
       ? [...checklist.removedItemCodes]
@@ -702,22 +887,28 @@ export class ChecklistsService {
       nextItems[updatedIdx] = normalizeChecklistEntry(updatedTarget);
     }
 
-    const nextChecklistVersion =
-      (Number(checklist.checklistVersion) || 1) + 1;
+    const nextChecklistVersion = currentWriteVersion + 1;
+    const nextHistory = this.appendChecklistVersionHistory(
+      checklist.versionHistory,
+      {
+        version: nextChecklistVersion,
+        scope: 'ITEM',
+        itemKeys: [target.itemId, target.categoryCode],
+        action: 'UPDATE_ITEM',
+      },
+    );
 
-    const updated = await this.checklistModel
-      .findByIdAndUpdate(
-        checklist._id,
-        {
-          $set: {
-            items: nextItems,
-            removedItemCodes,
-            checklistVersion: nextChecklistVersion,
-          },
-        },
-        { new: true },
-      )
-      .lean();
+    const updated = await this.atomicSaveChecklistVersion(
+      checklist,
+      currentWriteVersion,
+      {
+        items: nextItems,
+        removedItemCodes,
+        checklistVersion: nextChecklistVersion,
+        versionHistory: nextHistory,
+      },
+      dto.expectedChecklistVersion !== undefined,
+    );
 
     await this.syncAiConversationFromChecklist(
       checklist,
@@ -776,6 +967,12 @@ export class ChecklistsService {
 
     const qtyReq = Math.max(1, Math.floor(Number(dto.quantityRequired) || 1));
 
+    const currentWriteVersion = await this.assertOrResolveChecklistConcurrency(
+      checklist,
+      dto.expectedChecklistVersion,
+      [code, `item_${code.toLowerCase()}`],
+    );
+
     const ops: any[] = [
       {
         intent: 'ADD_ITEM',
@@ -808,22 +1005,28 @@ export class ChecklistsService {
       isChecklistReady: true,
     });
 
-    const nextChecklistVersion =
-      (Number(checklist.checklistVersion) || 1) + 1;
+    const nextChecklistVersion = currentWriteVersion + 1;
+    const nextHistory = this.appendChecklistVersionHistory(
+      checklist.versionHistory,
+      {
+        version: nextChecklistVersion,
+        scope: 'ITEM',
+        itemKeys: [code, `item_${code.toLowerCase()}`],
+        action: 'ADD_ITEM',
+      },
+    );
 
-    const updated = await this.checklistModel
-      .findByIdAndUpdate(
-        checklist._id,
-        {
-          $set: {
-            items: mut.items,
-            removedItemCodes: mut.removedItemCodes,
-            checklistVersion: nextChecklistVersion,
-          },
-        },
-        { new: true },
-      )
-      .lean();
+    const updated = await this.atomicSaveChecklistVersion(
+      checklist,
+      currentWriteVersion,
+      {
+        items: mut.items,
+        removedItemCodes: mut.removedItemCodes,
+        checklistVersion: nextChecklistVersion,
+        versionHistory: nextHistory,
+      },
+      dto.expectedChecklistVersion !== undefined,
+    );
 
     await this.syncAiConversationFromChecklist(
       checklist,
@@ -855,6 +1058,7 @@ export class ChecklistsService {
     currentUserId: string,
     checklistId: string,
     itemIdOrCategoryCode: string,
+    expectedChecklistVersion?: number,
   ): Promise<Record<string, any>> {
     if (!Types.ObjectId.isValid(checklistId)) {
       throw new NotFoundException('Mã checklist không hợp lệ');
@@ -880,6 +1084,12 @@ export class ChecklistsService {
       );
     }
 
+    const currentWriteVersion = await this.assertOrResolveChecklistConcurrency(
+      checklist,
+      expectedChecklistVersion,
+      [existing.itemId, existing.categoryCode],
+    );
+
     const mut = applyStructuredChecklistOperations({
       items: checklist.items || [],
       removedItemCodes: checklist.removedItemCodes || [],
@@ -895,22 +1105,28 @@ export class ChecklistsService {
       isChecklistReady: true,
     });
 
-    const nextChecklistVersion =
-      (Number(checklist.checklistVersion) || 1) + 1;
+    const nextChecklistVersion = currentWriteVersion + 1;
+    const nextHistory = this.appendChecklistVersionHistory(
+      checklist.versionHistory,
+      {
+        version: nextChecklistVersion,
+        scope: 'ITEM',
+        itemKeys: [existing.itemId, existing.categoryCode],
+        action: 'REMOVE_ITEM',
+      },
+    );
 
-    const updated = await this.checklistModel
-      .findByIdAndUpdate(
-        checklist._id,
-        {
-          $set: {
-            items: mut.items,
-            removedItemCodes: mut.removedItemCodes,
-            checklistVersion: nextChecklistVersion,
-          },
-        },
-        { new: true },
-      )
-      .lean();
+    const updated = await this.atomicSaveChecklistVersion(
+      checklist,
+      currentWriteVersion,
+      {
+        items: mut.items,
+        removedItemCodes: mut.removedItemCodes,
+        checklistVersion: nextChecklistVersion,
+        versionHistory: nextHistory,
+      },
+      expectedChecklistVersion !== undefined,
+    );
 
     await this.syncAiConversationFromChecklist(
       checklist,

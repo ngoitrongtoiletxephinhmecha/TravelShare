@@ -36,7 +36,7 @@ export default () => ({
   },
   gemini: {
     apiKey: process.env.GEMINI_API_KEY || '',
-    model: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
-    timeoutMs: parseInt(process.env.GEMINI_TIMEOUT_MS || '30000', 10),
+    model: process.env.GEMINI_MODEL || 'gemini-4-hydrogen',
+    timeoutMs: parseInt(process.env.GEMINI_TIMEOUT_MS || '60000', 10),
   },
 });

@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   HttpException,
   HttpStatus,
@@ -16,6 +17,7 @@ import {
   Checklist,
   ChecklistDocument,
   ChecklistEntry,
+  ChecklistVersionChange,
   GearRule,
   GearRuleDocument,
   TravelPlan,
@@ -50,168 +52,168 @@ const DEFAULT_GEAR_RULES: Array<{
   unit?: string;
   priority: ChecklistPriority;
   scalingRule:
-    | 'PER_PERSON'
-    | 'SHARED_2_3'
-    | 'ONE_PER_GROUP'
-    | 'PER_PERSON_DAY_2L'
-    | 'PER_PERSON_DAY';
+  | 'PER_PERSON'
+  | 'SHARED_2_3'
+  | 'ONE_PER_GROUP'
+  | 'PER_PERSON_DAY_2L'
+  | 'PER_PERSON_DAY';
   isRentable: boolean;
   overnightOnly?: boolean;
   reasonTemplate: string;
 }> = [
-  {
-    activity: ActivityType.TREKKING,
-    categoryCode: 'BACKPACK',
-    itemName: 'Balo trekking trợ lực (25L - 50L)',
-    unit: 'chiếc',
-    priority: ChecklistPriority.ESSENTIAL,
-    scalingRule: 'PER_PERSON',
-    isRentable: true,
-    reasonTemplate: 'Phân bổ trọng lượng đều lên hông và vai khi leo dốc.',
-  },
-  {
-    activity: ActivityType.TREKKING,
-    categoryCode: 'TREKKING_POLES',
-    itemName: 'Gậy trekking chống sốc',
-    unit: 'cặp',
-    priority: ChecklistPriority.ESSENTIAL,
-    scalingRule: 'PER_PERSON',
-    isRentable: true,
-    reasonTemplate: 'Giảm 25-30% áp lực lên khớp gối khi lên/xuống bậc đá dốc.',
-  },
-  {
-    activity: ActivityType.TREKKING,
-    categoryCode: 'TREKKING_SHOES',
-    itemName: 'Giày trekking cổ lửng chống trượt',
-    unit: 'đôi',
-    priority: ChecklistPriority.ESSENTIAL,
-    scalingRule: 'PER_PERSON',
-    isRentable: true,
-    reasonTemplate: 'Bảo vệ cổ chân và bám địa hình đá ẩm rêu phong.',
-  },
-  {
-    activity: ActivityType.TREKKING,
-    categoryCode: 'RAIN_JACKET',
-    itemName: 'Áo khoác gió chống nước / Áo mưa bộ',
-    unit: 'bộ',
-    priority: ChecklistPriority.ESSENTIAL,
-    scalingRule: 'PER_PERSON',
-    isRentable: false,
-    reasonTemplate: 'Giữ ấm và chống sương mù, mưa rừng bất chợt trên đỉnh núi.',
-  },
-  {
-    activity: ActivityType.TREKKING,
-    categoryCode: 'HEADLAMP',
-    itemName: 'Đèn đội đầu siêu sáng chống nước',
-    unit: 'chiếc',
-    priority: ChecklistPriority.CONDITIONAL,
-    scalingRule: 'PER_PERSON',
-    isRentable: true,
-    reasonTemplate: 'Cần thiết khi xuất phát sáng sớm hoặc xuống núi lúc chiều muộn.',
-  },
-  {
-    activity: ActivityType.TREKKING,
-    categoryCode: 'TENT',
-    itemName: 'Lều cắm trại chống mưa 2 lớp',
-    unit: 'bộ',
-    priority: ChecklistPriority.ESSENTIAL,
-    scalingRule: 'SHARED_2_3',
-    isRentable: true,
-    overnightOnly: true,
-    reasonTemplate: 'Dành cho hành trình trekking có nghỉ đêm ngoài trời.',
-  },
-  {
-    activity: ActivityType.TREKKING,
-    categoryCode: 'SLEEPING_BAG',
-    itemName: 'Túi ngủ giữ nhiệt vùng cao',
-    unit: 'chiếc',
-    priority: ChecklistPriority.ESSENTIAL,
-    scalingRule: 'PER_PERSON',
-    isRentable: true,
-    overnightOnly: true,
-    reasonTemplate: 'Đảm bảo thân nhiệt ban đêm khi ngủ lán hoặc lều.',
-  },
-  {
-    activity: ActivityType.TREKKING,
-    categoryCode: 'WATER_ELECTROLYTE',
-    itemName: 'Nước uống & Điện giải bù khoáng',
-    unit: 'lít',
-    priority: ChecklistPriority.ESSENTIAL,
-    scalingRule: 'PER_PERSON_DAY_2L',
-    isRentable: false,
-    reasonTemplate: 'Bù nước và khoáng chất liên tục (nhu yếu phẩm tự chuẩn bị, không cho thuê).',
-  },
-  {
-    activity: ActivityType.TREKKING,
-    categoryCode: 'TRAIL_FOOD',
-    itemName: 'Đồ ăn năng lượng / Lương khô / Thanh hạt',
-    unit: 'suất',
-    priority: ChecklistPriority.ESSENTIAL,
-    scalingRule: 'PER_PERSON_DAY',
-    isRentable: false,
-    reasonTemplate: 'Bổ sung năng lượng nhanh trên đường rừng (tự chuẩn bị, không cho thuê).',
-  },
-  {
-    activity: ActivityType.CAMPING,
-    categoryCode: 'TENT',
-    itemName: 'Lều cắm trại chống mưa PU3000mm+',
-    unit: 'bộ',
-    priority: ChecklistPriority.ESSENTIAL,
-    scalingRule: 'SHARED_2_3',
-    isRentable: true,
-    reasonTemplate: 'Không gian nghỉ ngơi chính cho nhóm cắm trại.',
-  },
-  {
-    activity: ActivityType.CAMPING,
-    categoryCode: 'CAMPING_STOVE',
-    itemName: 'Bếp gas dã ngoại & bộ nồi xếp gọn',
-    unit: 'bộ',
-    priority: ChecklistPriority.ESSENTIAL,
-    scalingRule: 'ONE_PER_GROUP',
-    isRentable: true,
-    reasonTemplate: 'Nấu ăn và pha đồ uống nóng tại bãi trại.',
-  },
-  {
-    activity: ActivityType.CAMPING,
-    categoryCode: 'CAMPING_CHAIR',
-    itemName: 'Ghế xếp camping thư giãn',
-    unit: 'chiếc',
-    priority: ChecklistPriority.CONDITIONAL,
-    scalingRule: 'PER_PERSON',
-    isRentable: true,
-    reasonTemplate: 'Tăng trải nghiệm nghỉ ngơi thoải mái bên hồ/bãi cỏ.',
-  },
-  {
-    activity: ActivityType.CAMPING,
-    categoryCode: 'HEADLAMP',
-    itemName: 'Đèn lồng / Đèn đội đầu cắm trại',
-    unit: 'chiếc',
-    priority: ChecklistPriority.ESSENTIAL,
-    scalingRule: 'PER_PERSON',
-    isRentable: true,
-    reasonTemplate: 'Chiếu sáng khu vực trại vào buổi tối.',
-  },
-  {
-    activity: ActivityType.CAMPING,
-    categoryCode: 'WATER_ELECTROLYTE',
-    itemName: 'Nước uống sinh hoạt & nấu nướng',
-    unit: 'lít',
-    priority: ChecklistPriority.ESSENTIAL,
-    scalingRule: 'PER_PERSON_DAY_2L',
-    isRentable: false,
-    reasonTemplate: 'Nước sạch dùng để nấu ăn và uống tại bãi trại (tự chuẩn bị).',
-  },
-  {
-    activity: ActivityType.CAMPING,
-    categoryCode: 'TRAIL_FOOD',
-    itemName: 'Thực phẩm BBQ / Đồ ăn dã ngoại',
-    unit: 'suất',
-    priority: ChecklistPriority.ESSENTIAL,
-    scalingRule: 'PER_PERSON_DAY',
-    isRentable: false,
-    reasonTemplate: 'Thực phẩm tươi và đồ ăn nhẹ theo khẩu vị nhóm (tự chuẩn bị).',
-  },
-];
+    {
+      activity: ActivityType.TREKKING,
+      categoryCode: 'BACKPACK',
+      itemName: 'Balo trekking trợ lực (25L - 50L)',
+      unit: 'chiếc',
+      priority: ChecklistPriority.ESSENTIAL,
+      scalingRule: 'PER_PERSON',
+      isRentable: true,
+      reasonTemplate: 'Phân bổ trọng lượng đều lên hông và vai khi leo dốc.',
+    },
+    {
+      activity: ActivityType.TREKKING,
+      categoryCode: 'TREKKING_POLES',
+      itemName: 'Gậy trekking chống sốc',
+      unit: 'cặp',
+      priority: ChecklistPriority.ESSENTIAL,
+      scalingRule: 'PER_PERSON',
+      isRentable: true,
+      reasonTemplate: 'Giảm 25-30% áp lực lên khớp gối khi lên/xuống bậc đá dốc.',
+    },
+    {
+      activity: ActivityType.TREKKING,
+      categoryCode: 'TREKKING_SHOES',
+      itemName: 'Giày trekking cổ lửng chống trượt',
+      unit: 'đôi',
+      priority: ChecklistPriority.ESSENTIAL,
+      scalingRule: 'PER_PERSON',
+      isRentable: true,
+      reasonTemplate: 'Bảo vệ cổ chân và bám địa hình đá ẩm rêu phong.',
+    },
+    {
+      activity: ActivityType.TREKKING,
+      categoryCode: 'RAIN_JACKET',
+      itemName: 'Áo khoác gió chống nước / Áo mưa bộ',
+      unit: 'bộ',
+      priority: ChecklistPriority.ESSENTIAL,
+      scalingRule: 'PER_PERSON',
+      isRentable: false,
+      reasonTemplate: 'Giữ ấm và chống sương mù, mưa rừng bất chợt trên đỉnh núi.',
+    },
+    {
+      activity: ActivityType.TREKKING,
+      categoryCode: 'HEADLAMP',
+      itemName: 'Đèn đội đầu siêu sáng chống nước',
+      unit: 'chiếc',
+      priority: ChecklistPriority.CONDITIONAL,
+      scalingRule: 'PER_PERSON',
+      isRentable: true,
+      reasonTemplate: 'Cần thiết khi xuất phát sáng sớm hoặc xuống núi lúc chiều muộn.',
+    },
+    {
+      activity: ActivityType.TREKKING,
+      categoryCode: 'TENT',
+      itemName: 'Lều cắm trại chống mưa 2 lớp',
+      unit: 'bộ',
+      priority: ChecklistPriority.ESSENTIAL,
+      scalingRule: 'SHARED_2_3',
+      isRentable: true,
+      overnightOnly: true,
+      reasonTemplate: 'Dành cho hành trình trekking có nghỉ đêm ngoài trời.',
+    },
+    {
+      activity: ActivityType.TREKKING,
+      categoryCode: 'SLEEPING_BAG',
+      itemName: 'Túi ngủ giữ nhiệt vùng cao',
+      unit: 'chiếc',
+      priority: ChecklistPriority.ESSENTIAL,
+      scalingRule: 'PER_PERSON',
+      isRentable: true,
+      overnightOnly: true,
+      reasonTemplate: 'Đảm bảo thân nhiệt ban đêm khi ngủ lán hoặc lều.',
+    },
+    {
+      activity: ActivityType.TREKKING,
+      categoryCode: 'WATER_ELECTROLYTE',
+      itemName: 'Nước uống & Điện giải bù khoáng',
+      unit: 'lít',
+      priority: ChecklistPriority.ESSENTIAL,
+      scalingRule: 'PER_PERSON_DAY_2L',
+      isRentable: false,
+      reasonTemplate: 'Bù nước và khoáng chất liên tục (nhu yếu phẩm tự chuẩn bị, không cho thuê).',
+    },
+    {
+      activity: ActivityType.TREKKING,
+      categoryCode: 'TRAIL_FOOD',
+      itemName: 'Đồ ăn năng lượng / Lương khô / Thanh hạt',
+      unit: 'suất',
+      priority: ChecklistPriority.ESSENTIAL,
+      scalingRule: 'PER_PERSON_DAY',
+      isRentable: false,
+      reasonTemplate: 'Bổ sung năng lượng nhanh trên đường rừng (tự chuẩn bị, không cho thuê).',
+    },
+    {
+      activity: ActivityType.CAMPING,
+      categoryCode: 'TENT',
+      itemName: 'Lều cắm trại chống mưa PU3000mm+',
+      unit: 'bộ',
+      priority: ChecklistPriority.ESSENTIAL,
+      scalingRule: 'SHARED_2_3',
+      isRentable: true,
+      reasonTemplate: 'Không gian nghỉ ngơi chính cho nhóm cắm trại.',
+    },
+    {
+      activity: ActivityType.CAMPING,
+      categoryCode: 'CAMPING_STOVE',
+      itemName: 'Bếp gas dã ngoại & bộ nồi xếp gọn',
+      unit: 'bộ',
+      priority: ChecklistPriority.ESSENTIAL,
+      scalingRule: 'ONE_PER_GROUP',
+      isRentable: true,
+      reasonTemplate: 'Nấu ăn và pha đồ uống nóng tại bãi trại.',
+    },
+    {
+      activity: ActivityType.CAMPING,
+      categoryCode: 'CAMPING_CHAIR',
+      itemName: 'Ghế xếp camping thư giãn',
+      unit: 'chiếc',
+      priority: ChecklistPriority.CONDITIONAL,
+      scalingRule: 'PER_PERSON',
+      isRentable: true,
+      reasonTemplate: 'Tăng trải nghiệm nghỉ ngơi thoải mái bên hồ/bãi cỏ.',
+    },
+    {
+      activity: ActivityType.CAMPING,
+      categoryCode: 'HEADLAMP',
+      itemName: 'Đèn lồng / Đèn đội đầu cắm trại',
+      unit: 'chiếc',
+      priority: ChecklistPriority.ESSENTIAL,
+      scalingRule: 'PER_PERSON',
+      isRentable: true,
+      reasonTemplate: 'Chiếu sáng khu vực trại vào buổi tối.',
+    },
+    {
+      activity: ActivityType.CAMPING,
+      categoryCode: 'WATER_ELECTROLYTE',
+      itemName: 'Nước uống sinh hoạt & nấu nướng',
+      unit: 'lít',
+      priority: ChecklistPriority.ESSENTIAL,
+      scalingRule: 'PER_PERSON_DAY_2L',
+      isRentable: false,
+      reasonTemplate: 'Nước sạch dùng để nấu ăn và uống tại bãi trại (tự chuẩn bị).',
+    },
+    {
+      activity: ActivityType.CAMPING,
+      categoryCode: 'TRAIL_FOOD',
+      itemName: 'Thực phẩm BBQ / Đồ ăn dã ngoại',
+      unit: 'suất',
+      priority: ChecklistPriority.ESSENTIAL,
+      scalingRule: 'PER_PERSON_DAY',
+      isRentable: false,
+      reasonTemplate: 'Thực phẩm tươi và đồ ăn nhẹ theo khẩu vị nhóm (tự chuẩn bị).',
+    },
+  ];
 
 @Injectable()
 export class AiService {
@@ -230,7 +232,7 @@ export class AiService {
     private readonly gearRuleModel: Model<GearRuleDocument>,
     private readonly parser: TripRequirementParser,
     private readonly validator: TripStateValidator,
-  ) {}
+  ) { }
 
   /**
    * Ensure sequential execution per conversation so concurrent requests never race or overwrite newer state
@@ -447,6 +449,7 @@ export class AiService {
         .findById(conversationId)
         .lean();
       this.assertOwnership(conv, currentUserId);
+      const initialConvStateVersion = Number(conv.stateVersion) || 1;
 
       const convObjId = new Types.ObjectId(conversationId);
       const userObjId = new Types.ObjectId(String(currentUserId));
@@ -469,56 +472,139 @@ export class AiService {
           })
           .lean();
 
-        const currentTripState = this.validator.normalizeExistingTripState(
-          conv.tripState || (conv.parsedRequirements as any),
-        );
-        const validation = this.validator.validateTripState(currentTripState);
+        // Only deduplicate cleanly if BOTH user & assistant messages finished persisting;
+        // if an earlier write crashed halfway leaving only an orphan user message, clean it up and process normally.
+        if (existingAssistantMsg) {
+          const currentTripState = this.validator.normalizeExistingTripState(
+            conv.tripState || (conv.parsedRequirements as any),
+          );
+          const validation =
+            this.validator.validateTripState(currentTripState);
 
-        let checklistPreview: ChecklistEntry[] = [];
-        if (conv.checklistId) {
-          const cl = await this.checklistModel.findById(conv.checklistId).lean();
-          if (cl?.items) checklistPreview = cl.items;
-        }
+          let checklistPreview: ChecklistEntry[] = [];
+          if (conv.checklistId) {
+            const cl = await this.checklistModel
+              .findById(conv.checklistId)
+              .lean();
+            if (cl?.items) checklistPreview = cl.items;
+          }
 
-        return {
-          conversationId,
-          deduplicated: true,
-          status: conv.status || validation.status,
-          stateVersion: conv.stateVersion || 1,
-          reply: existingAssistantMsg?.content || '',
-          userMessage: this.formatMessage(existingUserMsg),
-          assistantMessage: existingAssistantMsg
-            ? this.formatMessage(existingAssistantMsg)
-            : null,
-          tripState: currentTripState,
-          missingFields: conv.missingFields || validation.missingFields,
-          nextQuestion: conv.nextQuestion ?? validation.nextQuestion,
-          checklistPreview,
-          conversation: {
-            ...this.formatConversation(conv),
+          return {
+            conversationId,
+            deduplicated: true,
+            status: conv.status || validation.status,
+            stateVersion: conv.stateVersion || 1,
+            reply: existingAssistantMsg.content || '',
+            userMessage: this.formatMessage(existingUserMsg),
+            assistantMessage: this.formatMessage(existingAssistantMsg),
+            tripState: currentTripState,
+            missingFields: conv.missingFields || validation.missingFields,
+            nextQuestion: conv.nextQuestion ?? validation.nextQuestion,
             checklistPreview,
-          },
-        };
+            conversation: {
+              ...this.formatConversation(conv),
+              checklistPreview,
+            },
+          };
+        } else if (typeof (this.aiMessageModel as any).deleteOne === 'function') {
+          await (this.aiMessageModel as any).deleteOne({
+            _id: existingUserMsg._id,
+          });
+        }
       }
 
-      // 2. Parse user input and validate schema (before mutating conversation state!)
+      // 2. Load recent messages + saved plan/checklist BEFORE parsing so parser resolves context accurately
       const currentTripState = this.validator.normalizeExistingTripState(
         conv.tripState || (conv.parsedRequirements as any),
       );
+
+      const planModelAny = this.travelPlanModel as any;
+      const clModelAny = this.checklistModel as any;
+      const cloneSnapshot = (doc: any) => {
+        if (!doc || typeof doc !== 'object') return null;
+        const { toObject: _ignored, ...rest } = doc;
+        return {
+          ...rest,
+          ...(Array.isArray(doc.items)
+            ? {
+                items: doc.items.map((it: any) => ({
+                  ...it,
+                  requiredAttributes: it?.requiredAttributes
+                    ? { ...it.requiredAttributes }
+                    : {},
+                })),
+              }
+            : {}),
+          ...(Array.isArray(doc.removedItemCodes)
+            ? { removedItemCodes: [...doc.removedItemCodes] }
+            : {}),
+          ...(Array.isArray(doc.versionHistory)
+            ? { versionHistory: doc.versionHistory.map((h: any) => ({ ...h })) }
+            : {}),
+          ...(Array.isArray(doc.ownedGearCodes)
+            ? { ownedGearCodes: [...doc.ownedGearCodes] }
+            : {}),
+        };
+      };
+
+      const rawPlanBefore =
+        conv.travelPlanId && typeof planModelAny.findById === 'function'
+          ? await planModelAny.findById(conv.travelPlanId).lean()
+          : null;
+      const rawChecklistBefore =
+        conv.checklistId && typeof clModelAny.findById === 'function'
+          ? await clModelAny.findById(conv.checklistId).lean()
+          : null;
+      const existingPlanBeforeTurn = cloneSnapshot(rawPlanBefore);
+      const existingChecklistBeforeTurn = cloneSnapshot(rawChecklistBefore);
+
+      let recentMessagesRaw: any[] = [];
+      if (typeof (this.aiMessageModel as any).find === 'function') {
+        const msgQuery = (this.aiMessageModel as any)
+          .find({ aiConversationId: convObjId })
+          .sort({ _id: -1 });
+        recentMessagesRaw =
+          typeof msgQuery?.limit === 'function'
+            ? await msgQuery.limit(8).lean()
+            : (await msgQuery.lean()).slice(0, 8);
+      }
+      const recentMessages = [...recentMessagesRaw].reverse().map((m: any) => ({
+        role: m.role as 'user' | 'assistant',
+        content: String(m.content || ''),
+        qaSubjectDestination: m.structuredPayload?.qaSubjectDestination || null,
+      }));
 
       let patch;
       try {
         patch = await this.parser.parseUserTurn(rawText, currentTripState, {
           simulateError: dto.simulateError,
+          recentMessages,
+          lastAssistantQuestion: conv.nextQuestion,
+          existingChecklistItems: (existingChecklistBeforeTurn?.items || []).map(
+            (i: any) => ({
+              categoryCode: String(i.categoryCode),
+              name: String(i.name),
+              quantityRequired: Number(i.quantityRequired ?? i.quantityNeeded ?? 1),
+              quantityOwned: Number(i.quantityOwned || 0),
+              quantityMissing: Number(i.quantityMissing || 0),
+            }),
+          ),
         });
       } catch (err: any) {
         if (err instanceof AiProviderException) {
           const currentValidation =
             this.validator.validateTripState(currentTripState);
+          const mappedStatus =
+            err.code === 'QUOTA_EXCEEDED'
+              ? HttpStatus.TOO_MANY_REQUESTS
+              : err.code === 'NOT_FOUND' || err.code === 'INVALID_SCHEMA'
+                ? HttpStatus.BAD_GATEWAY
+                : HttpStatus.SERVICE_UNAVAILABLE;
           throw new HttpException(
             {
-              statusCode: HttpStatus.SERVICE_UNAVAILABLE,
+              statusCode: mappedStatus,
               code: err.code,
+              providerHttpStatus: err.httpStatus ?? null,
               message: err.message,
               canRetry: true,
               conversationId,
@@ -528,7 +614,7 @@ export class AiService {
                 conv.missingFields || currentValidation.missingFields,
               status: conv.status || currentValidation.status,
             },
-            HttpStatus.SERVICE_UNAVAILABLE,
+            mappedStatus,
           );
         }
         throw err;
@@ -544,14 +630,34 @@ export class AiService {
         patch.ambiguousDateNote,
       );
 
-      // 4. If READY_FOR_CHECKLIST (or checklist already exists), generate/update real TravelPlan & Checklist in MongoDB
+      const hasTripStateDelta = this.hasTripStateChanged(
+        currentTripState,
+        nextTripState,
+      );
+      const hasChecklistOperations =
+        (patch.checklistOperations?.length || 0) > 0;
+      const hasNonAmbiguousMutationOp = (patch.checklistOperations || []).some(
+        (op) => op.intent !== 'AMBIGUOUS_DECREMENT',
+      );
+      const isTripPlanWriteTurn =
+        hasTripStateDelta ||
+        hasNonAmbiguousMutationOp ||
+        Boolean(patch.requestChecklistCreate);
+      const shouldSyncPlanAndChecklist =
+        (validation.status === 'READY_FOR_CHECKLIST' && isTripPlanWriteTurn) ||
+        (Boolean(conv.checklistId) &&
+          (hasTripStateDelta || hasNonAmbiguousMutationOp));
+
+      // 4. Persist or read TravelPlan & Checklist cleanly (read-only QA/item queries never bump checklistVersion!)
       let checklistPreview: ChecklistEntry[] = [];
       let checklistMutationSummaries: string[] = [];
       let checklistClarifications: string[] = [];
       let travelPlanId = conv.travelPlanId;
       let checklistId = conv.checklistId;
+      let checklistJustCreated = false;
+      let didMutatePlanOrChecklist = false;
 
-      if (validation.status === 'READY_FOR_CHECKLIST' || checklistId) {
+      if (shouldSyncPlanAndChecklist) {
         const synced = await this.syncTravelPlanAndChecklist({
           userId: currentUserId,
           conversationId,
@@ -567,20 +673,90 @@ export class AiService {
         checklistPreview = synced.items;
         checklistMutationSummaries = synced.appliedSummaries;
         checklistClarifications = synced.clarificationQuestions;
-      } else if (patch.checklistOperations && patch.checklistOperations.length > 0) {
-        // Checklist is not ready yet (missing destination/activity/travelers/durationDays),
-        // but user mentioned checklist item commands -> collect any immediate clarification questions
-        const preCheck = applyStructuredChecklistOperations({
-          items: [],
-          removedItemCodes: [],
-          operations: patch.checklistOperations,
-          isChecklistReady: false,
-        });
-        checklistMutationSummaries = preCheck.appliedSummaries;
-        checklistClarifications = preCheck.clarificationQuestions;
+        checklistJustCreated = !existingChecklistBeforeTurn;
+        didMutatePlanOrChecklist = true;
+      } else {
+        if (existingChecklistBeforeTurn?.items) {
+          checklistPreview = existingChecklistBeforeTurn.items;
+        }
+        if (hasChecklistOperations) {
+          const preCheck = applyStructuredChecklistOperations({
+            items: checklistPreview,
+            removedItemCodes: existingChecklistBeforeTurn?.removedItemCodes || [],
+            operations: patch.checklistOperations || [],
+            isChecklistReady: Boolean(existingChecklistBeforeTurn),
+          });
+          checklistMutationSummaries = preCheck.appliedSummaries;
+          checklistClarifications = preCheck.clarificationQuestions;
+
+          // Persist pre-checklist required overrides, custom items, and removals across turns before checklist creation
+          if (!existingChecklistBeforeTurn) {
+            nextTripState.requiredGearQuantities = {
+              ...(nextTripState.requiredGearQuantities || {}),
+            };
+            nextTripState.removedGearCodes = [
+              ...(nextTripState.removedGearCodes || []),
+            ];
+            nextTripState.customGearItems = (
+              nextTripState.customGearItems || []
+            ).map((i) => ({ ...i }));
+
+            for (const op of patch.checklistOperations || []) {
+              const code = String(op.categoryCode).toUpperCase();
+              if (
+                op.intent === 'SET_REQUIRED' &&
+                typeof op.quantity === 'number' &&
+                op.quantity >= 1
+              ) {
+                nextTripState.requiredGearQuantities[code] = op.quantity;
+                nextTripState.removedGearCodes =
+                  nextTripState.removedGearCodes.filter((c) => c !== code);
+              } else if (
+                (op.intent === 'ADD_ITEM' ||
+                  op.intent === 'INCREMENT_REQUIRED') &&
+                typeof op.quantity === 'number' &&
+                op.quantity >= 1
+              ) {
+                const existingCustom = nextTripState.customGearItems.find(
+                  (c) => c.categoryCode.toUpperCase() === code,
+                );
+                if (existingCustom) {
+                  existingCustom.quantityRequired += op.quantity;
+                } else {
+                  nextTripState.customGearItems.push({
+                    categoryCode: code,
+                    itemName: op.itemName,
+                    quantityRequired: op.quantity,
+                    unit: op.unit,
+                  });
+                }
+                nextTripState.removedGearCodes =
+                  nextTripState.removedGearCodes.filter((c) => c !== code);
+              } else if (op.intent === 'REMOVE_ITEM') {
+                if (!nextTripState.removedGearCodes.includes(code)) {
+                  nextTripState.removedGearCodes.push(code);
+                }
+                delete nextTripState.requiredGearQuantities[code];
+                nextTripState.customGearItems =
+                  nextTripState.customGearItems.filter(
+                    (c) => c.categoryCode.toUpperCase() !== code,
+                  );
+              }
+            }
+          }
+        }
       }
 
-      // 5. Build natural Vietnamese assistant reply from the JUST-SAVED checklist & mutation results
+      const checklistReadReplies = this.buildChecklistReadReplies(
+        patch.readChecklistCodes || [],
+        checklistPreview,
+        Boolean(checklistId),
+      );
+
+      const shouldPrintFullChecklist =
+        checklistJustCreated || Boolean(patch.requestChecklistPrint);
+
+      // 5. Build natural Vietnamese assistant reply from the JUST-SAVED checklist & mutation/read results
       const assistantReplyText = this.validator.buildVietnameseAssistantReply({
         prevState: currentTripState,
         nextState: nextTripState,
@@ -589,9 +765,21 @@ export class AiService {
         checklistPreview,
         checklistMutationSummaries,
         checklistClarifications,
+        checklistReadReplies,
+        checklistJustCreated,
+        shouldPrintFullChecklist,
+        userMessage: rawText,
+        checklistExists: Boolean(checklistId),
       });
 
-      const nextVersion = (conv.stateVersion || 1) + 1;
+      const currentStateVersion = initialConvStateVersion;
+      const shouldBumpStateVersion =
+        hasTripStateDelta ||
+        didMutatePlanOrChecklist ||
+        this.hasTripStateChanged(currentTripState, nextTripState);
+      const nextVersion = shouldBumpStateVersion
+        ? currentStateVersion + 1
+        : currentStateVersion;
       const now = new Date();
 
       // Auto-update conversation title when destination/activity becomes known
@@ -602,93 +790,115 @@ export class AiService {
           nextTitle.startsWith('Chuyến đi '))
       ) {
         const actPrefix =
-          nextTripState.activity === ActivityType.CAMPING
+          nextTripState.activity === ActivityType.CAMPING ||
+          nextTripState.activity === ActivityType.BEACH_CAMPING
             ? 'Cắm trại'
-            : 'Trekking';
-        nextTitle = `${actPrefix} ${nextTripState.destination}${
-          nextTripState.durationDays
-            ? ` (${nextTripState.durationDays} ngày)`
-            : ''
-        }`;
+            : nextTripState.activity === ActivityType.TREKKING ||
+                nextTripState.activity === ActivityType.MOUNTAINEERING
+              ? 'Trekking'
+              : nextTripState.activity === ActivityType.MOTORBIKE_TOUR
+                ? 'Phượt'
+                : 'Chuyến đi';
+        nextTitle = `${actPrefix} ${nextTripState.destination}${nextTripState.durationDays
+          ? ` (${nextTripState.durationDays} ngày)`
+          : ''
+          }`;
       }
 
-      // 6. Persist User Message & Assistant Message
-      const createdUserMsg = await this.aiMessageModel.create({
-        aiConversationId: convObjId,
-        userId: userObjId,
-        role: 'user',
-        content: rawText,
-        clientMessageId,
-        stateVersion: nextVersion,
-        structuredPayload: {
-          extractedPatch: patch.updatedFields,
-          clearedFields: patch.clearedFields,
-          checklistOperations: patch.checklistOperations || [],
-        },
-      });
+      // 6 & 7. Persist Messages + Atomically CAS-update AiConversation with compensating rollback on partial failure
+      let createdUserMsg: any = null;
+      let createdAssistantMsg: any = null;
+      let updatedConv: any = null;
 
-      const createdAssistantMsg = await this.aiMessageModel.create({
-        aiConversationId: convObjId,
-        userId: userObjId,
-        role: 'assistant',
-        content: assistantReplyText,
-        replyToMessageId: createdUserMsg._id,
-        stateVersion: nextVersion,
-        structuredPayload: {
-          tripState: nextTripState,
-          missingFields: validation.missingFields,
-          status: validation.status,
-          nextQuestion: validation.nextQuestion,
-          providerMeta: patch.providerMeta,
-          checklistMutationSummaries,
-          checklistClarifications,
-          checklistPreview,
-        },
-      });
-
-      // 7. Atomically update AiConversation state with version check
-      const updatedConv = await this.aiConversationModel
-        .findOneAndUpdate(
-          {
-            _id: convObjId,
-            stateVersion: conv.stateVersion || 1,
+      try {
+        createdUserMsg = await this.aiMessageModel.create({
+          aiConversationId: convObjId,
+          userId: userObjId,
+          role: 'user',
+          content: rawText,
+          clientMessageId,
+          stateVersion: nextVersion,
+          structuredPayload: {
+            extractedPatch: patch.updatedFields,
+            clearedFields: patch.clearedFields,
+            checklistOperations: patch.checklistOperations || [],
+            turnActions: patch.turnActions || [],
           },
-          {
-            $set: {
-              title: nextTitle,
-              status: validation.status,
-              stateVersion: nextVersion,
-              tripState: nextTripState,
-              parsedRequirements: nextTripState as unknown as Record<
-                string,
-                unknown
-              >,
-              missingFields: validation.missingFields,
-              nextQuestion: validation.nextQuestion,
-              lastMessagePreview: assistantReplyText.slice(0, 140),
-              lastMessageAt: now,
-              ...(travelPlanId ? { travelPlanId } : {}),
-              ...(checklistId ? { checklistId } : {}),
+        });
+
+        createdAssistantMsg = await this.aiMessageModel.create({
+          aiConversationId: convObjId,
+          userId: userObjId,
+          role: 'assistant',
+          content: assistantReplyText,
+          replyToMessageId: createdUserMsg._id,
+          stateVersion: nextVersion,
+          structuredPayload: {
+            tripState: nextTripState,
+            missingFields: validation.missingFields,
+            status: validation.status,
+            nextQuestion: validation.nextQuestion,
+            providerMeta: patch.providerMeta,
+            qaSubjectDestination: patch.qaSubjectDestination || null,
+            turnActions: patch.turnActions || [],
+            checklistMutationSummaries,
+            checklistClarifications,
+            checklistReadReplies,
+            checklistPreview,
+          },
+        });
+
+        updatedConv = await this.aiConversationModel
+          .findOneAndUpdate(
+            {
+              _id: convObjId,
+              stateVersion: currentStateVersion,
             },
-          },
-          { new: true },
-        )
-        .lean();
+            {
+              $set: {
+                title: nextTitle,
+                status: validation.status,
+                stateVersion: nextVersion,
+                tripState: nextTripState,
+                parsedRequirements: nextTripState as unknown as Record<
+                  string,
+                  unknown
+                >,
+                missingFields: validation.missingFields,
+                nextQuestion: validation.nextQuestion,
+                lastMessagePreview: assistantReplyText.slice(0, 140),
+                lastMessageAt: now,
+                ...(travelPlanId ? { travelPlanId } : {}),
+                ...(checklistId ? { checklistId } : {}),
+              },
+            },
+            { new: true },
+          )
+          .lean();
 
-      const finalConv = updatedConv || {
-        ...conv,
-        title: nextTitle,
-        status: validation.status,
-        stateVersion: nextVersion,
-        tripState: nextTripState,
-        parsedRequirements: nextTripState,
-        missingFields: validation.missingFields,
-        nextQuestion: validation.nextQuestion,
-        lastMessagePreview: assistantReplyText.slice(0, 140),
-        lastMessageAt: now,
-        travelPlanId,
-        checklistId,
-      };
+        if (!updatedConv) {
+          throw new ConflictException({
+            code: 'CONVERSATION_VERSION_CONFLICT',
+            message:
+              'Cuộc hội thoại AI vừa được cập nhật đồng thời từ một tab khác. Dữ liệu đã được giữ an toàn, vui lòng tải lại và thử gửi lại.',
+          });
+        }
+      } catch (persistErr) {
+        await this.rollbackTurnMutations({
+          userMsgId: createdUserMsg?._id,
+          assistantMsgId: createdAssistantMsg?._id,
+          didMutatePlanOrChecklist,
+          prevPlanSnapshot: existingPlanBeforeTurn,
+          createdPlanId:
+            !existingPlanBeforeTurn && travelPlanId ? travelPlanId : undefined,
+          prevChecklistSnapshot: existingChecklistBeforeTurn,
+          createdChecklistId:
+            !existingChecklistBeforeTurn && checklistId
+              ? checklistId
+              : undefined,
+        });
+        throw persistErr;
+      }
 
       return {
         conversationId,
@@ -696,21 +906,148 @@ export class AiService {
         status: validation.status,
         stateVersion: nextVersion,
         reply: assistantReplyText,
-        userMessage: this.formatMessage(createdUserMsg.toObject()),
-        assistantMessage: this.formatMessage(createdAssistantMsg.toObject()),
+        userMessage: this.formatMessage(
+          createdUserMsg?.toObject ? createdUserMsg.toObject() : createdUserMsg,
+        ),
+        assistantMessage: this.formatMessage(
+          createdAssistantMsg?.toObject
+            ? createdAssistantMsg.toObject()
+            : createdAssistantMsg,
+        ),
         tripState: nextTripState,
         missingFields: validation.missingFields,
         nextQuestion: validation.nextQuestion,
         checklistPreview,
         checklistMutationSummaries,
         checklistClarifications,
+        checklistReadReplies,
         providerMeta: patch.providerMeta,
         conversation: {
-          ...this.formatConversation(finalConv),
+          ...this.formatConversation(updatedConv),
           checklistPreview,
         },
       };
     });
+  }
+
+  private hasTripStateChanged(
+    prev: ValidatedTripState,
+    next: ValidatedTripState,
+  ): boolean {
+    const scalarKeys: Array<keyof ValidatedTripState> = [
+      'intent',
+      'destination',
+      'route',
+      'activity',
+      'departureDate',
+      'endDate',
+      'durationDays',
+      'travelers',
+      'experienceLevel',
+      'budgetVnd',
+      'pickupArea',
+      'wantsToRent',
+      'notes',
+    ];
+    for (const k of scalarKeys) {
+      if ((prev[k] ?? null) !== (next[k] ?? null)) {
+        return true;
+      }
+    }
+    const prevGear = [...(prev.ownedGear || [])].sort().join(',');
+    const nextGear = [...(next.ownedGear || [])].sort().join(',');
+    if (prevGear !== nextGear) return true;
+
+    const prevQtys = JSON.stringify(prev.ownedGearQuantities || {});
+    const nextQtys = JSON.stringify(next.ownedGearQuantities || {});
+    if (prevQtys !== nextQtys) return true;
+
+    const prevReqQtys = JSON.stringify(prev.requiredGearQuantities || {});
+    const nextReqQtys = JSON.stringify(next.requiredGearQuantities || {});
+    if (prevReqQtys !== nextReqQtys) return true;
+
+    const prevRemoved = [...(prev.removedGearCodes || [])].sort().join(',');
+    const nextRemoved = [...(next.removedGearCodes || [])].sort().join(',');
+    if (prevRemoved !== nextRemoved) return true;
+
+    const prevCustom = JSON.stringify(prev.customGearItems || []);
+    const nextCustom = JSON.stringify(next.customGearItems || []);
+    return prevCustom !== nextCustom;
+  }
+
+  private buildChecklistReadReplies(
+    readCodes: string[],
+    checklistItems: ChecklistEntry[],
+    hasSavedChecklist: boolean,
+  ): string[] {
+    if (!readCodes || readCodes.length === 0) return [];
+    if (!hasSavedChecklist && checklistItems.length === 0) {
+      return [
+        'Hiện tại nhóm chưa tạo checklist được lưu. Hãy cho mình biết đủ hoạt động, địa điểm, số ngày và số người (hoặc nhấn **Tạo checklist**) để kiểm tra số lượng từng món nhé.',
+      ];
+    }
+
+    return readCodes.map((code) => {
+      const upper = String(code).toUpperCase();
+      const found = checklistItems.find(
+        (i) => String(i.categoryCode).toUpperCase() === upper,
+      );
+      if (!found) {
+        return `Hạng mục **${upper}** hiện không nằm trong checklist đang dùng (hoặc đã được bỏ khỏi danh sách).`;
+      }
+      const reqQty = found.quantityRequired ?? found.quantityNeeded;
+      return `Theo checklist hiện tại, **${found.name}** đang cần chuẩn bị **${reqQty} ${found.unit}**, nhóm đã có **${found.quantityOwned} ${found.unit}**, **còn thiếu ${found.quantityMissing} ${found.unit}**.`;
+    });
+  }
+
+  private async rollbackTurnMutations(params: {
+    userMsgId?: any;
+    assistantMsgId?: any;
+    didMutatePlanOrChecklist: boolean;
+    prevPlanSnapshot?: any;
+    createdPlanId?: any;
+    prevChecklistSnapshot?: any;
+    createdChecklistId?: any;
+  }): Promise<void> {
+    try {
+      const msgModelAny = this.aiMessageModel as any;
+      if (typeof msgModelAny.deleteOne === 'function') {
+        if (params.userMsgId) {
+          await msgModelAny.deleteOne({ _id: params.userMsgId });
+        }
+        if (params.assistantMsgId) {
+          await msgModelAny.deleteOne({ _id: params.assistantMsgId });
+        }
+      }
+
+      if (params.didMutatePlanOrChecklist) {
+        const clModelAny = this.checklistModel as any;
+        if (params.prevChecklistSnapshot) {
+          const { _id, ...restoreCl } = params.prevChecklistSnapshot;
+          await this.checklistModel.findByIdAndUpdate(_id, { $set: restoreCl });
+        } else if (
+          params.createdChecklistId &&
+          typeof clModelAny.deleteOne === 'function'
+        ) {
+          await clModelAny.deleteOne({ _id: params.createdChecklistId });
+        }
+
+        const planModelAny = this.travelPlanModel as any;
+        if (params.prevPlanSnapshot) {
+          const { _id, ...restorePlan } = params.prevPlanSnapshot;
+          await this.travelPlanModel.findByIdAndUpdate(_id, {
+            $set: restorePlan,
+          });
+        } else if (
+          params.createdPlanId &&
+          typeof planModelAny.deleteOne === 'function'
+        ) {
+          await planModelAny.deleteOne({ _id: params.createdPlanId });
+        }
+      }
+    } catch {
+      // Best-effort compensating rollback
+    }
   }
 
   /**
@@ -750,7 +1087,7 @@ export class AiService {
 
     const userObjId = new Types.ObjectId(String(userId));
     const convObjId = new Types.ObjectId(String(conversationId));
-    const activity = tripState.activity || ActivityType.TREKKING;
+    const activity = tripState.activity || ActivityType.OTHER;
     const travelers = Math.max(1, tripState.travelers || 1);
     const durationDays = Math.max(1, tripState.durationDays || 1);
 
@@ -768,6 +1105,9 @@ export class AiService {
       prevTripState.activity !== tripState.activity ||
       prevTripState.travelers !== tripState.travelers ||
       prevTripState.durationDays !== tripState.durationDays;
+
+    const didTravelersChange =
+      Boolean(prevChecklistDoc) && prevTripState.travelers !== tripState.travelers;
 
     const didTravelersOrDurationChange =
       Boolean(prevChecklistDoc) &&
@@ -788,11 +1128,16 @@ export class AiService {
       }));
     }
 
-    const prevRemovedCodes: string[] = Array.isArray(
-      prevChecklistDoc?.removedItemCodes,
-    )
-      ? prevChecklistDoc.removedItemCodes
-      : [];
+    const prevRemovedCodes: string[] = Array.from(
+      new Set([
+        ...(Array.isArray(prevChecklistDoc?.removedItemCodes)
+          ? prevChecklistDoc.removedItemCodes
+          : []),
+        ...(!prevChecklistDoc && Array.isArray(tripState.removedGearCodes)
+          ? tripState.removedGearCodes
+          : []),
+      ]),
+    );
 
     // 1. Determine base checklist items before applying this turn's structured checklistOperations
     let baseItems: ChecklistEntry[];
@@ -803,9 +1148,12 @@ export class AiService {
         travelers,
         ownedGearCodes: tripState.ownedGear || [],
         ownedGearQuantities: tripState.ownedGearQuantities || {},
+        requiredGearQuantities: tripState.requiredGearQuantities || {},
+        customGearItems: !prevChecklistDoc ? tripState.customGearItems || [] : [],
         dbRules: dbRules || [],
         previousItems,
         removedItemCodes: prevRemovedCodes,
+        didTravelersChange,
         didTravelersOrDurationChange,
       });
     } else {
@@ -823,17 +1171,33 @@ export class AiService {
     const finalItems = mutationResult.items;
     const finalRemovedCodes = mutationResult.removedItemCodes;
 
-    // Sync tripState.ownedGearQuantities & ownedGear with the mutated checklist items
+    // Sync tripState owned/required overrides & removals with the mutated checklist items
     const syncedOwnedCodes: string[] = [];
     const syncedOwnedQuantities: Record<string, number> = {
       ...(tripState.ownedGearQuantities || {}),
     };
+    const syncedRequiredQuantities: Record<string, number> = {};
+    const syncedCustomItems: NonNullable<ValidatedTripState['customGearItems']> = [];
+
     for (const item of finalItems) {
+      const code = String(item.categoryCode).toUpperCase();
       if (item.quantityOwned > 0) {
-        syncedOwnedCodes.push(item.categoryCode);
-        syncedOwnedQuantities[item.categoryCode] = item.quantityOwned;
+        syncedOwnedCodes.push(code);
+        syncedOwnedQuantities[code] = item.quantityOwned;
       } else if (item.userEditedOwned && item.quantityOwned === 0) {
-        delete syncedOwnedQuantities[item.categoryCode];
+        delete syncedOwnedQuantities[code];
+      }
+      if (item.userEditedRequired) {
+        syncedRequiredQuantities[code] =
+          item.quantityRequired ?? item.quantityNeeded ?? 1;
+      }
+      if (item.isCustomItem) {
+        syncedCustomItems.push({
+          categoryCode: code,
+          itemName: item.name,
+          quantityRequired: item.quantityRequired ?? item.quantityNeeded ?? 1,
+          unit: item.unit,
+        });
       }
     }
     for (const code of tripState.ownedGear || []) {
@@ -850,6 +1214,9 @@ export class AiService {
     }
     tripState.ownedGear = Array.from(new Set(syncedOwnedCodes));
     tripState.ownedGearQuantities = syncedOwnedQuantities;
+    tripState.requiredGearQuantities = syncedRequiredQuantities;
+    tripState.removedGearCodes = [...finalRemovedCodes];
+    tripState.customGearItems = syncedCustomItems;
 
     const nextPlanVersion = didTripScaleOrActivityChange
       ? (Number(prevChecklistDoc?.planVersion) || 0) + 1
@@ -871,6 +1238,9 @@ export class AiService {
       pickupArea: tripState.pickupArea || null,
       ownedGearCodes: tripState.ownedGear || [],
       ownedGearQuantities: tripState.ownedGearQuantities || {},
+      requiredGearQuantities: tripState.requiredGearQuantities || {},
+      removedGearCodes: tripState.removedGearCodes || [],
+      customGearItems: tripState.customGearItems || [],
       wantsToRent: Boolean(tripState.wantsToRent),
       planVersion: nextPlanVersion,
     };
@@ -889,6 +1259,35 @@ export class AiService {
     const checklistTitle = `Checklist ${tripState.destination || 'Chuyến đi'} (${durationDays} ngày • ${travelers} người)`;
     const nextChecklistVersion =
       (Number(prevChecklistDoc?.checklistVersion) || 0) + 1;
+    const touchedCodes = Array.from(
+      new Set(
+        (checklistOperations || [])
+          .filter((o) => o.intent !== 'AMBIGUOUS_DECREMENT')
+          .map((o) => String(o.categoryCode).toUpperCase()),
+      ),
+    );
+    const touchedKeys = touchedCodes.flatMap((c) => [
+      c,
+      `item_${c.toLowerCase()}`,
+    ]);
+    const prevHistory: ChecklistVersionChange[] = Array.isArray(
+      prevChecklistDoc?.versionHistory,
+    )
+      ? prevChecklistDoc.versionHistory
+      : [];
+    const nextHistory = [
+      ...prevHistory,
+      {
+        version: nextChecklistVersion,
+        scope:
+          !prevChecklistDoc || didTripScaleOrActivityChange || clearedOwnedGear
+            ? ('GLOBAL' as const)
+            : ('ITEM' as const),
+        itemKeys: touchedKeys,
+        action: 'AI_CHAT_SYNC',
+      },
+    ].slice(-30);
+
     const checklistPayload = {
       userId: userObjId,
       travelPlanId: planDoc._id,
@@ -898,6 +1297,7 @@ export class AiService {
       checklistVersion: nextChecklistVersion,
       items: finalItems,
       removedItemCodes: finalRemovedCodes,
+      versionHistory: nextHistory,
     };
 
     let checklistDoc: any;

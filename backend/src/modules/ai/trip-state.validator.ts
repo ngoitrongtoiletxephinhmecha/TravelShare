@@ -56,6 +56,9 @@ export class TripStateValidator {
       experienceLevel: null,
       ownedGear: [],
       ownedGearQuantities: {},
+      requiredGearQuantities: {},
+      removedGearCodes: [],
+      customGearItems: [],
       budgetVnd: null,
       pickupArea: null,
       wantsToRent: false,
@@ -90,6 +93,17 @@ export class TripStateValidator {
         raw.ownedGearQuantities && typeof raw.ownedGearQuantities === 'object'
           ? { ...raw.ownedGearQuantities }
           : {},
+      requiredGearQuantities:
+        raw.requiredGearQuantities &&
+        typeof raw.requiredGearQuantities === 'object'
+          ? { ...raw.requiredGearQuantities }
+          : {},
+      removedGearCodes: Array.isArray(raw.removedGearCodes)
+        ? [...raw.removedGearCodes]
+        : [],
+      customGearItems: Array.isArray(raw.customGearItems)
+        ? raw.customGearItems.map((i) => ({ ...i }))
+        : [],
       budgetVnd:
         typeof raw.budgetVnd === 'number' && raw.budgetVnd >= 0
           ? raw.budgetVnd
@@ -113,10 +127,18 @@ export class TripStateValidator {
     currentState: ValidatedTripState,
     patch: ExtractedTripPatch,
   ): ValidatedTripState {
+    const normalizedCurrent = this.normalizeExistingTripState(currentState);
     const next: ValidatedTripState = {
-      ...this.normalizeExistingTripState(currentState),
-      ownedGear: [...(currentState.ownedGear || [])],
-      ownedGearQuantities: { ...(currentState.ownedGearQuantities || {}) },
+      ...normalizedCurrent,
+      ownedGear: [...(normalizedCurrent.ownedGear || [])],
+      ownedGearQuantities: { ...(normalizedCurrent.ownedGearQuantities || {}) },
+      requiredGearQuantities: {
+        ...(normalizedCurrent.requiredGearQuantities || {}),
+      },
+      removedGearCodes: [...(normalizedCurrent.removedGearCodes || [])],
+      customGearItems: (normalizedCurrent.customGearItems || []).map((i) => ({
+        ...i,
+      })),
       ambiguousFields: [],
     };
 
@@ -256,12 +278,12 @@ export class TripStateValidator {
       nextQuestion = ambiguousDateNote;
     } else if (missingFields.includes('destination') && missingFields.includes('activity')) {
       nextQuestion =
-        'Bạn dự định đi địa điểm nào và tham gia hoạt động gì (ví dụ: trekking Yên Tử, cắm trại Hồ Đồng Đò hay săn mây Lảo Thẩn)?';
+        'Bạn dự định đi địa điểm nào và tham gia hoạt động gì (ví dụ: cắm trại Ba Vì, trekking Yên Tử hay tham quan)?';
     } else if (missingFields.includes('destination')) {
       nextQuestion =
-        'Bạn dự định đi trekking/cắm trại ở địa điểm nào để mình tư vấn trang bị phù hợp địa hình nhé?';
+        'Bạn dự định đi địa điểm nào để mình tư vấn phù hợp nhé?';
     } else if (missingFields.includes('activity')) {
-      nextQuestion = `Tại **${state.destination}**, bạn dự định đi **trekking leo núi**, **cắm trại qua đêm (camping)** hay đi dã ngoại nhẹ nhàng?`;
+      nextQuestion = `Tại **${state.destination}**, bạn dự định đi **tham quan**, **trekking leo núi** hay **cắm trại**?`;
     } else if (
       missingFields.includes('durationDays') &&
       missingFields.includes('travelers')
@@ -310,6 +332,11 @@ export class TripStateValidator {
     checklistPreview?: ChecklistEntry[];
     checklistMutationSummaries?: string[];
     checklistClarifications?: string[];
+    checklistReadReplies?: string[];
+    checklistJustCreated?: boolean;
+    shouldPrintFullChecklist?: boolean;
+    userMessage?: string;
+    checklistExists?: boolean;
   }): string {
     const {
       prevState,
@@ -319,8 +346,24 @@ export class TripStateValidator {
       checklistPreview,
       checklistMutationSummaries = [],
       checklistClarifications = [],
+      checklistReadReplies = [],
+      checklistJustCreated = false,
+      shouldPrintFullChecklist = false,
+      userMessage = '',
+      checklistExists = false,
     } = params;
     const lines: string[] = [];
+
+    if (patch.providerFailureNote && !patch.generalAnswer && !patch.destinationAnswer && !patch.itineraryAnswer) {
+      return patch.providerFailureNote;
+    }
+
+    if (patch.isUnrecognizedFallback) {
+      const preservedHint = nextState.destination
+        ? `Thông tin chuyến đi (**${nextState.destination}**) và checklist hiện tại vẫn được giữ nguyên.`
+        : 'Hiện chưa có thông tin kế hoạch nào bị thay đổi.';
+      return `Mình chưa rõ ý bạn muốn hỏi thông tin, cập nhật kế hoạch hay chỉnh sửa checklist. ${preservedHint} Bạn có thể nói cụ thể hơn (ví dụ: *"Giới thiệu Ba Vì"*, *"Đi Ba Vì cắm trại 2 ngày 3 người"*, hoặc *"Nhóm đã có 2 balo"*).`;
+    }
 
     // 1. Summarize what was recognized or updated in this turn
     const changes: string[] = [];
@@ -329,11 +372,10 @@ export class TripStateValidator {
       patch.updatedFields.destination &&
       patch.updatedFields.destination !== prevState.destination
     ) {
-      const actLabel = nextState.activity
-        ? ACTIVITY_LABELS_VI[nextState.activity]
-        : 'chuyến đi';
       changes.push(
-        `địa điểm **${nextState.destination}** (${actLabel})`,
+        nextState.activity
+          ? `địa điểm **${nextState.destination}** (${ACTIVITY_LABELS_VI[nextState.activity]})`
+          : `địa điểm **${nextState.destination}**`,
       );
     } else if (
       patch.updatedFields.activity &&
@@ -416,6 +458,52 @@ export class TripStateValidator {
       );
     }
 
+    const hasDestinationQa = Boolean(patch.destinationAnswer);
+    const hasGeneralQa = Boolean(patch.generalAnswer);
+    const hasItineraryAdvice = Boolean(patch.itineraryAnswer);
+    const hasReadReplies = checklistReadReplies.length > 0;
+    const isSmallTalkOnly = Boolean(
+      patch.turnActions?.includes('SMALL_TALK') &&
+        changes.length === 0 &&
+        checklistMutationSummaries.length === 0 &&
+        !hasDestinationQa &&
+        !hasGeneralQa &&
+        !hasItineraryAdvice &&
+        !hasReadReplies,
+    );
+    const isPureChecklistView = Boolean(
+      patch.requestChecklistPrint &&
+        changes.length === 0 &&
+        checklistMutationSummaries.length === 0 &&
+        !hasDestinationQa &&
+        !hasGeneralQa &&
+        !hasItineraryAdvice &&
+        !hasReadReplies,
+    );
+
+    if (isSmallTalkOnly) {
+      if (/(cảm\s*ơn|thank|ok(?:ie)?|tạm\s*biệt|bye)/i.test(userMessage)) {
+        return 'Không có gì đâu bạn! Nếu bạn cần hỏi thêm về điểm đến, kinh nghiệm chuẩn bị đồ hay chỉnh checklist chuyến đi, cứ nhắn mình bất cứ lúc nào nhé.';
+      }
+      return 'Chào bạn! Mình là **Trợ lý AI TravelShare**. Mình có thể trò chuyện giải đáp về địa điểm, tư vấn đồ dùng dã ngoại hoặc giúp bạn lập kế hoạch và checklist cho chuyến đi. Bạn đang quan tâm đến chủ đề nào?';
+    }
+
+    if (hasDestinationQa && patch.destinationAnswer) {
+      lines.push(patch.destinationAnswer);
+    }
+
+    if (hasGeneralQa && patch.generalAnswer) {
+      lines.push(patch.generalAnswer);
+    }
+
+    if (hasItineraryAdvice && patch.itineraryAnswer) {
+      lines.push(patch.itineraryAnswer);
+    }
+
+    if (hasReadReplies) {
+      lines.push(checklistReadReplies.map((r) => `📦 ${r}`).join('\n'));
+    }
+
     if (checklistMutationSummaries.length > 0) {
       lines.push(
         checklistMutationSummaries.map((s) => `✅ ${s}`).join('\n'),
@@ -424,24 +512,59 @@ export class TripStateValidator {
         lines.push(`Đồng thời mình đã ghi nhận: ${changes.join(', ')}.`);
       }
     } else if (changes.length > 0) {
-      lines.push(`Mình đã ghi nhận cập nhật cho chuyến đi của bạn: ${changes.join(', ')}.`);
-    } else if (nextState.destination) {
+      lines.push(`Mình đã ghi nhận vào kế hoạch chuyến đi: ${changes.join(', ')}.`);
+    } else if (
+      !hasDestinationQa &&
+      !hasGeneralQa &&
+      !hasItineraryAdvice &&
+      !hasReadReplies &&
+      !isPureChecklistView &&
+      !checklistJustCreated &&
+      checklistClarifications.length === 0
+    ) {
+      if (nextState.destination) {
+        lines.push(
+          `Mình vẫn đang lưu thông tin chuyến đi **${nextState.destination}** của bạn.`,
+        );
+      } else {
+        lines.push(
+          'Chào bạn! Mình là **Trợ lý AI TravelShare**, sẵn sàng giải đáp thắc mắc hoặc hỗ trợ bạn lên kế hoạch và checklist cho chuyến đi.',
+        );
+      }
+    }
+
+    if (patch.preliminaryGearSuggestion) {
+      lines.push(`🎒 **Gợi ý đồ chuẩn bị sơ bộ:** ${patch.preliminaryGearSuggestion}`);
+    }
+
+    if (hasItineraryAdvice) {
+      const savedParts: string[] = [];
+      if (nextState.destination) savedParts.push(nextState.destination);
+      if (nextState.activity) {
+        savedParts.push(ACTIVITY_LABELS_VI[nextState.activity]);
+      }
+      if (nextState.durationDays) {
+        savedParts.push(`${nextState.durationDays} ngày`);
+      }
+      if (nextState.travelers) {
+        savedParts.push(`${nextState.travelers} người`);
+      }
       lines.push(
-        `Mình vẫn đang lưu thông tin chuyến đi **${nextState.destination}** của bạn.`,
-      );
-    } else {
-      lines.push(
-        'Chào bạn! Mình là **Trợ lý AI TravelShare**, chuyên tư vấn chuẩn bị đồ trekking, camping và kết nối thiết bị cho thuê từ cộng đồng.',
+        savedParts.length > 0
+          ? `📌 *Lưu ý dữ liệu:* Thông tin kế hoạch đã lưu gồm **${savedParts.join(' • ')}**. Lịch trình chi tiết từng buổi/ngày ở trên chỉ là gợi ý tham khảo trong hội thoại (không tự tạo hoặc sửa checklist nếu bạn chưa yêu cầu).`
+          : '📌 *Lưu ý dữ liệu:* Lịch trình trên là gợi ý tham khảo trong hội thoại; hệ thống chưa lưu hay tạo checklist cho đến khi bạn chốt thông tin chuyến đi.',
       );
     }
 
-    // 2. Destination-specific terrain note (never fabricating live weather or operating hours)
+    // 2. Destination-specific terrain note when starting a Yên Tử trip without repeating if QA already ran
     if (
+      !hasDestinationQa &&
+      !patch.preliminaryGearSuggestion &&
       patch.updatedFields.destination === 'Yên Tử' &&
       prevState.destination !== 'Yên Tử'
     ) {
       lines.push(
-        '⛰️ **Lưu ý địa hình Yên Tử:** Cung đường Yên Tử có nhiều bậc đá dốc và độ ẩm cao ở khu vực rừng trúc — chùa Đồng. Bạn nên ưu tiên giày bám đường tốt, gậy trekking trợ lực khớp gối và áo khoác chắn gió. *(Lưu ý: Thời tiết thực tế và lịch vận hành cáp treo có thể thay đổi theo ngày, bạn nhớ kiểm tra dự báo thời tiết mới nhất trước giờ xuất phát nhé).*',
+        '⛰️ **Lưu ý địa hình Yên Tử:** Cung đường Yên Tử có nhiều bậc đá dốc và độ ẩm cao. Bạn nên ưu tiên giày bám đường tốt, gậy leo núi và áo khoác chắn gió; đồng thời kiểm tra lại dự báo thời tiết trước giờ xuất phát.',
       );
     }
 
@@ -457,45 +580,84 @@ export class TripStateValidator {
     }
 
     // 3. Follow-up question or READY_FOR_CHECKLIST summary
+    const isReadOrQaOnly =
+      (hasDestinationQa ||
+        hasGeneralQa ||
+        hasItineraryAdvice ||
+        hasReadReplies) &&
+      changes.length === 0 &&
+      checklistMutationSummaries.length === 0 &&
+      !checklistJustCreated &&
+      !patch.requestChecklistPrint;
+
+    const asksPureAdviceOnly =
+      (hasGeneralQa || (hasItineraryAdvice && !validation.missingFields.length)) &&
+      checklistMutationSummaries.length === 0 &&
+      !checklistJustCreated;
+
     if (validation.status === 'NEEDS_INFORMATION') {
       if (
+        !isReadOrQaOnly &&
+        !asksPureAdviceOnly &&
+        !hasItineraryAdvice &&
         validation.nextQuestion &&
         !patch.ambiguousDateNote &&
         checklistClarifications.length === 0
       ) {
         lines.push(validation.nextQuestion);
       }
-    } else {
-      if (checklistMutationSummaries.length === 0) {
+    } else if (!isReadOrQaOnly) {
+      if (
+        checklistMutationSummaries.length === 0 &&
+        (checklistJustCreated || changes.length > 0)
+      ) {
         lines.push(
-          `✅ **Thông tin chuyến đi đã đủ để lập Checklist chuẩn bị đồ!** (${nextState.destination || 'Chuyến đi'} • ${
-            nextState.activity ? ACTIVITY_LABELS_VI[nextState.activity] : 'Trekking'
-          } • ${nextState.durationDays} ngày • ${nextState.travelers} người).`,
+          `✅ **Kế hoạch chuyến đi đã đủ thông tin (READY_FOR_CHECKLIST)!** (${nextState.destination || 'Chuyến đi'} • ${
+            nextState.activity
+              ? ACTIVITY_LABELS_VI[nextState.activity]
+              : 'Chưa chọn hoạt động'
+          } • ${nextState.durationDays} ngày • ${nextState.travelers} người).${
+            !checklistJustCreated && !checklistExists
+              ? ' Bạn có thể bấm nút **Tạo checklist** trên màn hình hoặc nhắn *"Tạo checklist"* bất cứ lúc nào.'
+              : ''
+          }`,
         );
       }
 
-      if (checklistPreview && checklistPreview.length > 0) {
-        const previewLines = checklistPreview
-          .slice(0, 7)
-          .map((item) => {
-            const reqQty = item.quantityRequired ?? item.quantityNeeded;
-            return `- **${item.name}**: Cần **${reqQty}** (Đã có: **${item.quantityOwned}**, Còn thiếu: **${item.quantityMissing}** — *${
-              item.priority === ChecklistPriority.ESSENTIAL
-                ? 'Thiết yếu'
-                : 'Khuyên dùng'
-            }*)`;
-          });
+      if (
+        shouldPrintFullChecklist &&
+        checklistPreview &&
+        checklistPreview.length > 0
+      ) {
+        const itemsToPrint = patch.requestChecklistPrint
+          ? checklistPreview
+          : checklistPreview.slice(0, 7);
+        const previewLines = itemsToPrint.map((item) => {
+          const reqQty = item.quantityRequired ?? item.quantityNeeded;
+          return `- **${item.name}**: Cần **${reqQty}** (Đã có: **${item.quantityOwned}**, Còn thiếu: **${item.quantityMissing}** — *${
+            item.priority === ChecklistPriority.ESSENTIAL
+              ? 'Thiết yếu'
+              : 'Khuyên dùng'
+          }*)`;
+        });
         lines.push(
-          `📋 **Bản xem trước Checklist hiện tại (${nextState.travelers} người):**\n${previewLines.join('\n')}`,
+          `📋 **Checklist hiện tại (${nextState.travelers} người):**\n${previewLines.join('\n')}`,
+        );
+      } else if (
+        patch.requestChecklistPrint &&
+        (!checklistPreview || checklistPreview.length === 0)
+      ) {
+        lines.push(
+          '📋 Hiện tại chưa có checklist được lưu. Hãy cho mình biết địa điểm, hoạt động, số ngày và số người (hoặc bấm **Tạo checklist**) để lập danh sách nhé.',
         );
       }
 
-      if (checklistClarifications.length === 0) {
-        if (validation.nextQuestion) {
+      if (checklistClarifications.length === 0 && !isPureChecklistView) {
+        if (validation.nextQuestion && (checklistJustCreated || changes.length > 0)) {
           lines.push(`💡 *Gợi ý thêm:* ${validation.nextQuestion}`);
-        } else {
+        } else if (checklistJustCreated) {
           lines.push(
-            'Bạn có thể điều chỉnh lại số người, số ngày, bổ sung đồ đã có hoặc nhập ngân sách/khu vực nhận đồ bất cứ lúc nào!',
+            'Bạn có thể điều chỉnh lại số lượng đồ cần/đã có bằng chat hoặc trực tiếp trên bảng checklist bất cứ lúc nào!',
           );
         }
       }

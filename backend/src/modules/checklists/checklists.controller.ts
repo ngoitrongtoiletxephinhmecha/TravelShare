@@ -8,6 +8,7 @@ import {
   Param,
   Patch,
   Post,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
@@ -101,11 +102,16 @@ export class ChecklistsController {
     @Param('id') checklistId: string,
     @Param('itemId') itemId: string,
     @CurrentUser() user: RequestUser,
+    @Query('expectedChecklistVersion') expectedChecklistVersion?: string,
   ) {
+    const parsedVersion = expectedChecklistVersion
+      ? parseInt(expectedChecklistVersion, 10)
+      : undefined;
     return this.checklistsService.removeChecklistItem(
       user.userId,
       checklistId,
       itemId,
+      parsedVersion && !Number.isNaN(parsedVersion) ? parsedVersion : undefined,
     );
   }
 

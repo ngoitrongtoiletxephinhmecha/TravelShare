@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
 } from '@nestjs/common';
 import { Types } from 'mongoose';
@@ -101,6 +102,22 @@ describe('ChecklistsService & Gear Matching Suite (Phase 7)', () => {
           checklistsStore.set(String(id), existing);
         }
         return makeChainable(existing || null);
+      }),
+      findOneAndUpdate: jest.fn().mockImplementation((filter: any, update: any) => {
+        const existing = checklistsStore.get(String(filter._id));
+        if (
+          !existing ||
+          (filter.checklistVersion !== undefined &&
+            Number(existing.checklistVersion || 1) !==
+              Number(filter.checklistVersion))
+        ) {
+          return makeChainable(null);
+        }
+        if (update.$set) {
+          Object.assign(existing, update.$set, { updatedAt: new Date() });
+          checklistsStore.set(String(existing._id), existing);
+        }
+        return makeChainable(existing);
       }),
     };
 
@@ -713,5 +730,90 @@ describe('ChecklistsService & Gear Matching Suite (Phase 7)', () => {
     expect(
       afterRegen.items.find((i: any) => i.categoryCode === 'CAMPING_CHAIR'),
     ).toBeUndefined();
+  });
+
+  // =========================================================================
+  // 5. PHASE 9A: TWO-TAB OPTIMISTIC CONCURRENCY (COMPATIBLE MERGE VS 409 CONFLICT)
+  // =========================================================================
+  it('merges compatible checklist updates across tabs and returns 409 Conflict when two tabs edit the same item', async () => {
+    const planId = new Types.ObjectId();
+    travelPlansStore.set(String(planId), {
+      _id: planId,
+      userId: new Types.ObjectId(user1Id),
+      destination: 'Vườn Quốc gia Ba Vì',
+      activity: ActivityType.CAMPING,
+      durationDays: 2,
+      travelers: 4,
+      ownedGearCodes: [],
+      planVersion: 1,
+    });
+
+    const v1 = await checklistsService.generateOrGetChecklistForPlan(
+      user1Id,
+      String(planId),
+    );
+    expect(v1.checklistVersion).toBe(1);
+
+    // Tab A loads v1 and updates TENT owned = 1 -> advances checklistVersion to 2
+    const v2 = await checklistsService.updateChecklistItem(
+      user1Id,
+      v1.id,
+      'item_TENT',
+      {
+        quantityOwned: 1,
+        ownedConfirmed: true,
+        expectedChecklistVersion: 1,
+      },
+    );
+    expect(v2.checklistVersion).toBe(2);
+    expect(v2.items.find((i: any) => i.categoryCode === 'TENT')).toMatchObject({
+      quantityRequired: 2,
+      quantityOwned: 1,
+      quantityMissing: 1,
+    });
+
+    // Tab B (still holding stale version 1) updates a DIFFERENT item (CAMPING_CHAIR owned = 2)
+    // -> compatible change! Server merges onto v2 without losing Tab A's tent edit, advancing to v3.
+    const v3Merged = await checklistsService.updateChecklistItem(
+      user1Id,
+      v1.id,
+      'item_CAMPING_CHAIR',
+      {
+        quantityOwned: 2,
+        ownedConfirmed: true,
+        expectedChecklistVersion: 1,
+      },
+    );
+    expect(v3Merged.checklistVersion).toBe(3);
+    expect(
+      v3Merged.items.find((i: any) => i.categoryCode === 'TENT'),
+    ).toMatchObject({
+      quantityOwned: 1,
+      quantityMissing: 1,
+    });
+    expect(
+      v3Merged.items.find((i: any) => i.categoryCode === 'CAMPING_CHAIR'),
+    ).toMatchObject({
+      quantityRequired: 4,
+      quantityOwned: 2,
+      quantityMissing: 2,
+    });
+
+    // Tab C (stale version 1) tries to overwrite TENT which Tab A already edited -> 409 ConflictException!
+    await expect(
+      checklistsService.updateChecklistItem(user1Id, v1.id, 'item_TENT', {
+        quantityOwned: 0,
+        ownedConfirmed: true,
+        expectedChecklistVersion: 1,
+      }),
+    ).rejects.toThrow(ConflictException);
+
+    // Verify DB still keeps merged TENT=1 & CAMPING_CHAIR=2 intact
+    const latest = await checklistsService.getChecklistById(user1Id, v1.id);
+    expect(latest.checklistVersion).toBe(3);
+    expect(latest.items.find((i: any) => i.categoryCode === 'TENT')?.quantityOwned).toBe(1);
+    expect(
+      latest.items.find((i: any) => i.categoryCode === 'CAMPING_CHAIR')?.quantityOwned,
+    ).toBe(2);
   });
 });

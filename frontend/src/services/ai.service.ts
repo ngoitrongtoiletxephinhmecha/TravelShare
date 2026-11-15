@@ -117,13 +117,22 @@ export function normalizeAiMessage(raw: any): AiMessageItem {
   };
 }
 
+/** Dedicated chat timeout longer than backend GEMINI_TIMEOUT_MS (60s) so client receives structured backend responses/errors cleanly. */
+export const AI_CHAT_REQUEST_TIMEOUT_MS = 75000;
+
 export const aiService = {
   async createConversation(payload?: {
     title?: string;
     initialMessage?: string;
     clientMessageId?: string;
   }): Promise<AiConversationItem & { initialTurn?: AiTurnResponse }> {
-    const { data } = await apiClient.post('/ai/conversations', payload || {});
+    const { data } = await apiClient.post(
+      '/ai/conversations',
+      payload || {},
+      payload?.initialMessage
+        ? { timeout: AI_CHAT_REQUEST_TIMEOUT_MS }
+        : undefined,
+    );
     const raw = data.data || {};
     const conv = normalizeAiConversation(raw);
     return {
@@ -172,12 +181,17 @@ export const aiService = {
     payload: {
       content: string;
       clientMessageId: string;
-      simulateError?: 'TIMEOUT' | 'QUOTA_EXCEEDED' | 'INVALID_SCHEMA';
+      simulateError?:
+        | 'TIMEOUT'
+        | 'QUOTA_EXCEEDED'
+        | 'INVALID_SCHEMA'
+        | 'NOT_FOUND';
     },
   ): Promise<AiTurnResponse> {
     const { data } = await apiClient.post(
       `/ai/conversations/${conversationId}/messages`,
       payload,
+      { timeout: AI_CHAT_REQUEST_TIMEOUT_MS },
     );
     const raw = data.data || {};
     return {
