@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { GearModule } from '../gear/gear.module';
+import { MediaModule } from '../media/media.module';
 import {
   AdminDisputesController,
   BookingsController,
@@ -8,7 +9,7 @@ import { BookingsService } from './bookings.service';
 import { BookingEventsService } from './booking-events.service';
 
 @Module({
-  imports: [GearModule],
+  imports: [GearModule, MediaModule],
   controllers: [BookingsController, AdminDisputesController],
   providers: [BookingsService, BookingEventsService],
   exports: [BookingsService, BookingEventsService],

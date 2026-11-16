@@ -120,12 +120,29 @@ export const socialService = {
     return data.data;
   },
 
-  async uploadMedia(files: File[]): Promise<UploadedMediaItem[]> {
+  async uploadMedia(
+    files: File[],
+    options?: {
+      scope?: 'GENERAL' | 'BOOKING_HANDOVER' | 'BOOKING_DISPUTE';
+      bookingId?: string;
+    },
+  ): Promise<UploadedMediaItem[]> {
     const formData = new FormData();
+    if (options?.scope) {
+      formData.append('scope', options.scope);
+    }
+    if (options?.bookingId) {
+      formData.append('bookingId', options.bookingId);
+    }
     files.forEach((file) => {
       formData.append('files', file);
     });
+    const params: Record<string, string> = {};
+    if (options?.scope) params.scope = options.scope;
+    if (options?.bookingId) params.bookingId = options.bookingId;
+
     const { data } = await apiClient.post('/media/upload', formData, {
+      params,
       headers: {
         'Content-Type': 'multipart/form-data',
       },

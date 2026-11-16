@@ -39,6 +39,7 @@ import {
 } from '../../common/enums/system.enums';
 import { BookingsService } from '../bookings/bookings.service';
 import { NotificationsService } from '../notifications/notifications.service';
+import { AuthEventsService } from '../auth/auth-events.service';
 import {
   AdminModerateContentDto,
   AdminResolveDisputeDto,
@@ -68,6 +69,7 @@ export class AdminService {
     private readonly auditLogModel: Model<ModerationAuditLogDocument>,
     @Optional() private readonly bookingsService?: BookingsService,
     @Optional() private readonly notificationsService?: NotificationsService,
+    @Optional() private readonly authEventsService?: AuthEventsService,
   ) {}
 
   async getOverview() {
@@ -247,6 +249,12 @@ export class AdminService {
       user.refreshSessions = [];
     }
     await user.save();
+    if (dto.status !== AccountStatus.ACTIVE) {
+      this.authEventsService?.emitSessionRevoked({
+        userId: String(targetUserId),
+        reason: 'ACCOUNT_LOCKED',
+      });
+    }
 
     await this.auditLogModel.create({
       actorId: new Types.ObjectId(adminId),

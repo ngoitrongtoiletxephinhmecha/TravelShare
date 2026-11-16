@@ -1,4 +1,4 @@
-import { apiClient } from './api';
+import { apiBaseURL, apiClient, refreshSessionSingleFlight } from './api';
 import { AuthResponse, AuthUser, UserProfile } from '../types';
 
 export const authService = {
@@ -18,6 +18,23 @@ export const authService = {
   }): Promise<AuthResponse> {
     const { data } = await apiClient.post('/auth/login', payload);
     return data.data;
+  },
+
+  async getGoogleOAuthStatus(): Promise<{
+    provider: 'google';
+    configured: boolean;
+    message: string;
+  }> {
+    const { data } = await apiClient.get('/auth/google/status');
+    return data.data;
+  },
+
+  getGoogleLoginUrl(redirectPath = '/feed'): string {
+    return `${apiBaseURL}/auth/google?redirect=${encodeURIComponent(redirectPath)}`;
+  },
+
+  async refreshSession() {
+    return refreshSessionSingleFlight();
   },
 
   async logout(): Promise<void> {

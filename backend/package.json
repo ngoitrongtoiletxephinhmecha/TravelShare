@@ -16,7 +16,10 @@
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
     "test:e2e": "jest --config ./test/jest-e2e.json",
-    "seed": "ts-node src/database/seed.ts"
+    "seed": "ts-node src/database/seed.ts",
+    "seed:demo": "ts-node src/database/seed.ts --with-demo",
+    "migrate:activities": "ts-node src/database/migrate-activity-types.ts",
+    "verify:9b": "ts-node src/database/verify-phase9b-replica.ts"
   },
   "dependencies": {
     "@google/generative-ai": "^0.21.0",

@@ -22,8 +22,10 @@ const TOPICS: { value: ActivityType | 'ALL'; label: string }[] = [
   { value: 'CAMPING', label: 'Camping / Cắm trại' },
   { value: 'MOTORBIKE_TOUR', label: 'Phượt xe máy' },
   { value: 'BACKPACKING', label: 'Backpacking' },
-  { value: 'MOUNTAINEERING', label: 'Đỉnh cao' },
-  { value: 'BEACH_CAMPING', label: 'Cắm trại biển' },
+  { value: 'MOUNTAINEERING', label: 'Leo núi kỹ thuật' },
+  { value: 'BEACH', label: 'Đi biển' },
+  { value: 'SIGHTSEEING', label: 'Tham quan' },
+  { value: 'OTHER', label: 'Hoạt động khác' },
 ];
 
 export const ExplorePage: React.FC = () => {

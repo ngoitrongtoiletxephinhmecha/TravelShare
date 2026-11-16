@@ -33,6 +33,7 @@ import {
   NotificationType,
   UserRole,
 } from '../common/enums/system.enums';
+import { BUILTIN_CHECKLIST_RULES } from '../modules/checklists/checklist-mutation.engine';
 
 const CATEGORIES = [
   {
@@ -185,20 +186,43 @@ const CATEGORIES = [
   },
 ];
 
-const GEAR_RULES = [
-  { activity: ActivityType.TREKKING, categoryCode: 'BACKPACK', itemName: 'Balo trekking trợ lực', priority: ChecklistPriority.ESSENTIAL, scalingRule: 'PER_PERSON', isRentable: true, reasonTemplate: 'Bắt buộc để mang nước, đồ ăn và áo giữ nhiệt suốt hành trình trekking.' },
-  { activity: ActivityType.TREKKING, categoryCode: 'TREKKING_POLES', itemName: 'Gậy trekking leo núi', priority: ChecklistPriority.ESSENTIAL, scalingRule: 'PER_PERSON', isRentable: true, reasonTemplate: 'Giảm 25-30% áp lực lên khớp gối khi lên/xuống dốc đá hoặc bậc thang.' },
-  { activity: ActivityType.TREKKING, categoryCode: 'TREKKING_SHOES', itemName: 'Giày trekking bám địa hình', priority: ChecklistPriority.ESSENTIAL, scalingRule: 'PER_PERSON', isRentable: true, reasonTemplate: 'Chống trơn trượt và bảo vệ cổ chân trên đường rừng.' },
-  { activity: ActivityType.TREKKING, categoryCode: 'HEADLAMP', itemName: 'Đèn đội đầu chiếu sáng', priority: ChecklistPriority.CONDITIONAL, scalingRule: 'PER_PERSON', isRentable: true, reasonTemplate: 'Cần thiết khi xuất phát sớm hoặc xuống núi muộn lúc trời sẩm tối.' },
-  { activity: ActivityType.CAMPING, categoryCode: 'TENT', itemName: 'Lều cắm trại chống mưa', priority: ChecklistPriority.ESSENTIAL, scalingRule: 'SHARED_2_3', isRentable: true, reasonTemplate: 'Nơi nghỉ ngơi qua đêm, chắn gió và sương lạnh.' },
-  { activity: ActivityType.CAMPING, categoryCode: 'SLEEPING_BAG', itemName: 'Túi ngủ giữ nhiệt', priority: ChecklistPriority.ESSENTIAL, scalingRule: 'PER_PERSON', isRentable: true, reasonTemplate: 'Giữ ấm cơ thể khi nhiệt độ ban đêm hạ thấp.' },
-  { activity: ActivityType.CAMPING, categoryCode: 'CAMPING_STOVE', itemName: 'Bếp dã ngoại & bộ nồi', priority: ChecklistPriority.CONDITIONAL, scalingRule: 'ONE_PER_GROUP', isRentable: true, reasonTemplate: 'Nấu ăn và đun nước nóng cho cả nhóm tại bãi trại.' },
-];
+const GEAR_RULES = BUILTIN_CHECKLIST_RULES.map((rule) => ({
+  activity: rule.activity,
+  categoryCode: rule.categoryCode,
+  itemName: rule.itemName,
+  priority: rule.priority,
+  scalingRule: rule.scalingRule,
+  isRentable: rule.canRent,
+  reasonTemplate: rule.reasonTemplate,
+}));
 
 async function runSeed() {
-  const uri = process.env.MONGODB_URI || 'mongodb://localhost:27017/travelshare';
+  const nodeEnv = process.env.NODE_ENV || 'development';
+  const isProduction = nodeEnv === 'production';
+  const allowDemoSeed =
+    !isProduction &&
+    (process.argv.includes('--with-demo') ||
+      process.env.ALLOW_DEMO_SEED === 'true' ||
+      process.env.DEMO_MODE === 'true');
+
+  if (
+    isProduction &&
+    (process.argv.includes('--with-demo') ||
+      process.env.ALLOW_DEMO_SEED === 'true' ||
+      process.env.DEMO_MODE === 'true')
+  ) {
+    throw new Error(
+      'SECURITY_BLOCK: Không được phép chạy seed dữ liệu/tài khoản demo trong môi trường production.',
+    );
+  }
+
+  const uri = allowDemoSeed
+    ? process.env.MONGODB_DEMO_URI ||
+      process.env.MONGODB_URI ||
+      'mongodb://localhost:27017/travelshare_demo'
+    : process.env.MONGODB_URI || 'mongodb://localhost:27017/travelshare';
   await mongoose.connect(uri);
-  console.log('Connected to MongoDB for seeding...');
+  console.log(`Connected to MongoDB for seeding (env=${nodeEnv}, demoSeed=${allowDemoSeed})...`);
 
   const UserModel = mongoose.model('User', UserSchema);
   const ProfileModel = mongoose.model('Profile', ProfileSchema);
@@ -234,6 +258,15 @@ async function runSeed() {
       { $set: rule },
       { upsert: true },
     );
+  }
+
+  if (!allowDemoSeed) {
+    console.log(
+      'Skipped demo admin/users/sample data seeding (pass --with-demo or set ALLOW_DEMO_SEED=true in non-production to seed demo data).',
+    );
+    await mongoose.disconnect();
+    console.log('Catalog & rules seed completed successfully!');
+    return;
   }
 
   const passwordHash = await bcrypt.hash('TravelShare@123', 10);
@@ -284,7 +317,11 @@ async function runSeed() {
         role: acc.role,
         status: AccountStatus.ACTIVE,
         emailVerified: true,
+        isDemo: true,
       });
+    } else if (!user.isDemo) {
+      user.isDemo = true;
+      await user.save();
     }
     await ProfileModel.updateOne(
       { userId: user._id },
@@ -591,6 +628,85 @@ async function runSeed() {
       availabilitySettings: {
         minRentalDays: 1,
         maxRentalDays: 10,
+        advanceNoticeHours: 4,
+      },
+      status: GearStatus.ACTIVE,
+      moderationStatus: GearModerationStatus.APPROVED,
+      isActive: true,
+      isDemo: true,
+    },
+    {
+      ownerId: vyUser._id,
+      categoryId: categoryMap['CAMERA']._id,
+      categoryCode: 'CAMERA',
+      title: '[DEMO] Action Cam GoPro Hero 12 Black (Chống nước biển 10m)',
+      description:
+        'Camera hành trình chống nước phù hợp đi biển Cát Bà, lặn ngắm san hô, chèo SUP và du lịch tham quan. Kèm 2 pin, thẻ 128GB và phao tay cầm nổi.',
+      brand: 'GoPro',
+      condition: GearCondition.LIKE_NEW,
+      attributes: {
+        resolution: '5.3K60',
+        waterproof: true,
+      },
+      images: [
+        'https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?w=900&auto=format&fit=crop&q=80',
+      ],
+      totalQuantity: 2,
+      sharingType: GearListingType.RENT,
+      listingType: GearListingType.RENT,
+      pricePerDay: 140000,
+      dailyPriceVnd: 140000,
+      depositAmount: 1500000,
+      depositAmountVnd: 1500000,
+      city: 'Hà Nội',
+      district: 'Cầu Giấy',
+      pickupLocation: {
+        type: 'Point' as const,
+        coordinates: [105.79, 21.036],
+      },
+      usageRules: ['Rửa sạch nước ngọt sau khi ngâm nước biển', 'Hoàn trả kèm pin và phao nổi'],
+      availabilitySettings: {
+        minRentalDays: 1,
+        maxRentalDays: 14,
+        advanceNoticeHours: 4,
+      },
+      status: GearStatus.ACTIVE,
+      moderationStatus: GearModerationStatus.APPROVED,
+      isActive: true,
+      isDemo: true,
+    },
+    {
+      ownerId: vyUser._id,
+      categoryId: categoryMap['CAMPING_CHAIR']._id,
+      categoryCode: 'CAMPING_CHAIR',
+      title: '[DEMO] Ghế xếp dã ngoại Naturehike gấp gọn nhẹ đi biển & cắm trại',
+      description:
+        'Ghế khung nhôm 7075 siêu nhẹ chịu tải 120kg, vải Oxford thoáng khí nhanh khô, phù hợp bãi biển, hồ Trị An hoặc cắm trại đồi.',
+      brand: 'Naturehike',
+      condition: GearCondition.LIKE_NEW,
+      attributes: {
+        weightGrams: 950,
+      },
+      images: [
+        'https://images.unsplash.com/photo-1504280390367-361c6d9f38f4?w=900&auto=format&fit=crop&q=80',
+      ],
+      totalQuantity: 4,
+      sharingType: GearListingType.RENT,
+      listingType: GearListingType.RENT,
+      pricePerDay: 35000,
+      dailyPriceVnd: 35000,
+      depositAmount: 200000,
+      depositAmountVnd: 200000,
+      city: 'Hồ Chí Minh',
+      district: 'Quận 1',
+      pickupLocation: {
+        type: 'Point' as const,
+        coordinates: [106.7, 10.776],
+      },
+      usageRules: ['Phủi sạch cát trước khi gấp túi'],
+      availabilitySettings: {
+        minRentalDays: 1,
+        maxRentalDays: 14,
         advanceNoticeHours: 4,
       },
       status: GearStatus.ACTIVE,

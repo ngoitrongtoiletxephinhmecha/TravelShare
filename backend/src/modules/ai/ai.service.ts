@@ -6,6 +6,7 @@ import {
   HttpStatus,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
@@ -26,7 +27,6 @@ import {
 } from '../../database/schemas';
 import {
   ActivityType,
-  ChecklistPriority,
   ExperienceLevel,
 } from '../../common/enums/system.enums';
 import {
@@ -44,176 +44,7 @@ import {
   buildChecklistEntriesFromRules,
   ParsedChecklistOperation,
 } from '../checklists/checklist-mutation.engine';
-
-const DEFAULT_GEAR_RULES: Array<{
-  activity: ActivityType;
-  categoryCode: string;
-  itemName: string;
-  unit?: string;
-  priority: ChecklistPriority;
-  scalingRule:
-  | 'PER_PERSON'
-  | 'SHARED_2_3'
-  | 'ONE_PER_GROUP'
-  | 'PER_PERSON_DAY_2L'
-  | 'PER_PERSON_DAY';
-  isRentable: boolean;
-  overnightOnly?: boolean;
-  reasonTemplate: string;
-}> = [
-    {
-      activity: ActivityType.TREKKING,
-      categoryCode: 'BACKPACK',
-      itemName: 'Balo trekking trợ lực (25L - 50L)',
-      unit: 'chiếc',
-      priority: ChecklistPriority.ESSENTIAL,
-      scalingRule: 'PER_PERSON',
-      isRentable: true,
-      reasonTemplate: 'Phân bổ trọng lượng đều lên hông và vai khi leo dốc.',
-    },
-    {
-      activity: ActivityType.TREKKING,
-      categoryCode: 'TREKKING_POLES',
-      itemName: 'Gậy trekking chống sốc',
-      unit: 'cặp',
-      priority: ChecklistPriority.ESSENTIAL,
-      scalingRule: 'PER_PERSON',
-      isRentable: true,
-      reasonTemplate: 'Giảm 25-30% áp lực lên khớp gối khi lên/xuống bậc đá dốc.',
-    },
-    {
-      activity: ActivityType.TREKKING,
-      categoryCode: 'TREKKING_SHOES',
-      itemName: 'Giày trekking cổ lửng chống trượt',
-      unit: 'đôi',
-      priority: ChecklistPriority.ESSENTIAL,
-      scalingRule: 'PER_PERSON',
-      isRentable: true,
-      reasonTemplate: 'Bảo vệ cổ chân và bám địa hình đá ẩm rêu phong.',
-    },
-    {
-      activity: ActivityType.TREKKING,
-      categoryCode: 'RAIN_JACKET',
-      itemName: 'Áo khoác gió chống nước / Áo mưa bộ',
-      unit: 'bộ',
-      priority: ChecklistPriority.ESSENTIAL,
-      scalingRule: 'PER_PERSON',
-      isRentable: false,
-      reasonTemplate: 'Giữ ấm và chống sương mù, mưa rừng bất chợt trên đỉnh núi.',
-    },
-    {
-      activity: ActivityType.TREKKING,
-      categoryCode: 'HEADLAMP',
-      itemName: 'Đèn đội đầu siêu sáng chống nước',
-      unit: 'chiếc',
-      priority: ChecklistPriority.CONDITIONAL,
-      scalingRule: 'PER_PERSON',
-      isRentable: true,
-      reasonTemplate: 'Cần thiết khi xuất phát sáng sớm hoặc xuống núi lúc chiều muộn.',
-    },
-    {
-      activity: ActivityType.TREKKING,
-      categoryCode: 'TENT',
-      itemName: 'Lều cắm trại chống mưa 2 lớp',
-      unit: 'bộ',
-      priority: ChecklistPriority.ESSENTIAL,
-      scalingRule: 'SHARED_2_3',
-      isRentable: true,
-      overnightOnly: true,
-      reasonTemplate: 'Dành cho hành trình trekking có nghỉ đêm ngoài trời.',
-    },
-    {
-      activity: ActivityType.TREKKING,
-      categoryCode: 'SLEEPING_BAG',
-      itemName: 'Túi ngủ giữ nhiệt vùng cao',
-      unit: 'chiếc',
-      priority: ChecklistPriority.ESSENTIAL,
-      scalingRule: 'PER_PERSON',
-      isRentable: true,
-      overnightOnly: true,
-      reasonTemplate: 'Đảm bảo thân nhiệt ban đêm khi ngủ lán hoặc lều.',
-    },
-    {
-      activity: ActivityType.TREKKING,
-      categoryCode: 'WATER_ELECTROLYTE',
-      itemName: 'Nước uống & Điện giải bù khoáng',
-      unit: 'lít',
-      priority: ChecklistPriority.ESSENTIAL,
-      scalingRule: 'PER_PERSON_DAY_2L',
-      isRentable: false,
-      reasonTemplate: 'Bù nước và khoáng chất liên tục (nhu yếu phẩm tự chuẩn bị, không cho thuê).',
-    },
-    {
-      activity: ActivityType.TREKKING,
-      categoryCode: 'TRAIL_FOOD',
-      itemName: 'Đồ ăn năng lượng / Lương khô / Thanh hạt',
-      unit: 'suất',
-      priority: ChecklistPriority.ESSENTIAL,
-      scalingRule: 'PER_PERSON_DAY',
-      isRentable: false,
-      reasonTemplate: 'Bổ sung năng lượng nhanh trên đường rừng (tự chuẩn bị, không cho thuê).',
-    },
-    {
-      activity: ActivityType.CAMPING,
-      categoryCode: 'TENT',
-      itemName: 'Lều cắm trại chống mưa PU3000mm+',
-      unit: 'bộ',
-      priority: ChecklistPriority.ESSENTIAL,
-      scalingRule: 'SHARED_2_3',
-      isRentable: true,
-      reasonTemplate: 'Không gian nghỉ ngơi chính cho nhóm cắm trại.',
-    },
-    {
-      activity: ActivityType.CAMPING,
-      categoryCode: 'CAMPING_STOVE',
-      itemName: 'Bếp gas dã ngoại & bộ nồi xếp gọn',
-      unit: 'bộ',
-      priority: ChecklistPriority.ESSENTIAL,
-      scalingRule: 'ONE_PER_GROUP',
-      isRentable: true,
-      reasonTemplate: 'Nấu ăn và pha đồ uống nóng tại bãi trại.',
-    },
-    {
-      activity: ActivityType.CAMPING,
-      categoryCode: 'CAMPING_CHAIR',
-      itemName: 'Ghế xếp camping thư giãn',
-      unit: 'chiếc',
-      priority: ChecklistPriority.CONDITIONAL,
-      scalingRule: 'PER_PERSON',
-      isRentable: true,
-      reasonTemplate: 'Tăng trải nghiệm nghỉ ngơi thoải mái bên hồ/bãi cỏ.',
-    },
-    {
-      activity: ActivityType.CAMPING,
-      categoryCode: 'HEADLAMP',
-      itemName: 'Đèn lồng / Đèn đội đầu cắm trại',
-      unit: 'chiếc',
-      priority: ChecklistPriority.ESSENTIAL,
-      scalingRule: 'PER_PERSON',
-      isRentable: true,
-      reasonTemplate: 'Chiếu sáng khu vực trại vào buổi tối.',
-    },
-    {
-      activity: ActivityType.CAMPING,
-      categoryCode: 'WATER_ELECTROLYTE',
-      itemName: 'Nước uống sinh hoạt & nấu nướng',
-      unit: 'lít',
-      priority: ChecklistPriority.ESSENTIAL,
-      scalingRule: 'PER_PERSON_DAY_2L',
-      isRentable: false,
-      reasonTemplate: 'Nước sạch dùng để nấu ăn và uống tại bãi trại (tự chuẩn bị).',
-    },
-    {
-      activity: ActivityType.CAMPING,
-      categoryCode: 'TRAIL_FOOD',
-      itemName: 'Thực phẩm BBQ / Đồ ăn dã ngoại',
-      unit: 'suất',
-      priority: ChecklistPriority.ESSENTIAL,
-      scalingRule: 'PER_PERSON_DAY',
-      isRentable: false,
-      reasonTemplate: 'Thực phẩm tươi và đồ ăn nhẹ theo khẩu vị nhóm (tự chuẩn bị).',
-    },
-  ];
+import { ChecklistsService } from '../checklists/checklists.service';
 
 @Injectable()
 export class AiService {
@@ -232,6 +63,7 @@ export class AiService {
     private readonly gearRuleModel: Model<GearRuleDocument>,
     private readonly parser: TripRequirementParser,
     private readonly validator: TripStateValidator,
+    @Optional() private readonly checklistsService?: ChecklistsService,
   ) { }
 
   /**
@@ -527,13 +359,13 @@ export class AiService {
           ...rest,
           ...(Array.isArray(doc.items)
             ? {
-                items: doc.items.map((it: any) => ({
-                  ...it,
-                  requiredAttributes: it?.requiredAttributes
-                    ? { ...it.requiredAttributes }
-                    : {},
-                })),
-              }
+              items: doc.items.map((it: any) => ({
+                ...it,
+                requiredAttributes: it?.requiredAttributes
+                  ? { ...it.requiredAttributes }
+                  : {},
+              })),
+            }
             : {}),
           ...(Array.isArray(doc.removedItemCodes)
             ? { removedItemCodes: [...doc.removedItemCodes] }
@@ -634,6 +466,10 @@ export class AiService {
         currentTripState,
         nextTripState,
       );
+      const hasChecklistInputDelta = this.hasChecklistAffectingChanged(
+        currentTripState,
+        nextTripState,
+      );
       const hasChecklistOperations =
         (patch.checklistOperations?.length || 0) > 0;
       const hasNonAmbiguousMutationOp = (patch.checklistOperations || []).some(
@@ -644,9 +480,33 @@ export class AiService {
         hasNonAmbiguousMutationOp ||
         Boolean(patch.requestChecklistCreate);
       const shouldSyncPlanAndChecklist =
-        (validation.status === 'READY_FOR_CHECKLIST' && isTripPlanWriteTurn) ||
+        (validation.status === 'READY_FOR_CHECKLIST' &&
+          (hasChecklistInputDelta ||
+            hasNonAmbiguousMutationOp ||
+            Boolean(patch.requestChecklistCreate) ||
+            (!conv.checklistId && isTripPlanWriteTurn))) ||
         (Boolean(conv.checklistId) &&
-          (hasTripStateDelta || hasNonAmbiguousMutationOp));
+          (hasChecklistInputDelta || hasNonAmbiguousMutationOp));
+
+      // Keep TravelPlan metadata (departureDate, pickupArea, budgetVnd, destination, wantsToRent) synced even when checklist items don't regenerate
+      if (
+        !shouldSyncPlanAndChecklist &&
+        hasTripStateDelta &&
+        conv.travelPlanId
+      ) {
+        await this.travelPlanModel.findByIdAndUpdate(conv.travelPlanId, {
+          $set: {
+            destination: nextTripState.destination || 'Việt Nam',
+            route: nextTripState.route || null,
+            departureDate: nextTripState.departureDate
+              ? new Date(`${nextTripState.departureDate}T00:00:00.000Z`)
+              : undefined,
+            budgetVnd: nextTripState.budgetVnd || 0,
+            pickupArea: nextTripState.pickupArea || null,
+            wantsToRent: Boolean(nextTripState.wantsToRent),
+          },
+        });
+      }
 
       // 4. Persist or read TravelPlan & Checklist cleanly (read-only QA/item queries never bump checklistVersion!)
       let checklistPreview: ChecklistEntry[] = [];
@@ -753,6 +613,27 @@ export class AiService {
         Boolean(checklistId),
       );
 
+      const savedSpotsReply = patch.requestSavedSpotsRead
+        ? this.buildSavedSpotsReply(nextTripState, patch.qaSubjectDestination)
+        : null;
+
+      const missingItemsReply = patch.requestMissingItemsList
+        ? this.buildMissingItemsReply(checklistPreview, Boolean(checklistId))
+        : null;
+
+      let rentalMatchReply: string | null = null;
+      let rentalMatchResult: Record<string, any> | null = null;
+      if (patch.requestRentalGearMatch) {
+        const rentalRes = await this.buildChatRentalMatchReply({
+          userId: currentUserId,
+          checklistId: checklistId ? String(checklistId) : null,
+          checklistItems: checklistPreview,
+          tripState: nextTripState,
+        });
+        rentalMatchReply = rentalRes.replyText;
+        rentalMatchResult = rentalRes.matchResult;
+      }
+
       const shouldPrintFullChecklist =
         checklistJustCreated || Boolean(patch.requestChecklistPrint);
 
@@ -766,6 +647,9 @@ export class AiService {
         checklistMutationSummaries,
         checklistClarifications,
         checklistReadReplies,
+        savedSpotsReply,
+        missingItemsReply,
+        rentalMatchReply,
         checklistJustCreated,
         shouldPrintFullChecklist,
         userMessage: rawText,
@@ -790,15 +674,21 @@ export class AiService {
           nextTitle.startsWith('Chuyến đi '))
       ) {
         const actPrefix =
-          nextTripState.activity === ActivityType.CAMPING ||
-          nextTripState.activity === ActivityType.BEACH_CAMPING
-            ? 'Cắm trại'
-            : nextTripState.activity === ActivityType.TREKKING ||
-                nextTripState.activity === ActivityType.MOUNTAINEERING
-              ? 'Trekking'
-              : nextTripState.activity === ActivityType.MOTORBIKE_TOUR
-                ? 'Phượt'
-                : 'Chuyến đi';
+          nextTripState.activity === ActivityType.CAMPING &&
+          nextTripState.environment === 'COASTAL'
+            ? 'Cắm trại biển'
+            : nextTripState.activity === ActivityType.CAMPING
+              ? 'Cắm trại'
+              : nextTripState.activity === ActivityType.BEACH
+                ? 'Đi biển'
+                : nextTripState.activity === ActivityType.SIGHTSEEING
+                  ? 'Tham quan'
+                  : nextTripState.activity === ActivityType.TREKKING ||
+                      nextTripState.activity === ActivityType.MOUNTAINEERING
+                    ? 'Trekking'
+                    : nextTripState.activity === ActivityType.MOTORBIKE_TOUR
+                      ? 'Phượt'
+                      : 'Chuyến đi';
         nextTitle = `${actPrefix} ${nextTripState.destination}${nextTripState.durationDays
           ? ` (${nextTripState.durationDays} ngày)`
           : ''
@@ -845,6 +735,7 @@ export class AiService {
             checklistClarifications,
             checklistReadReplies,
             checklistPreview,
+            ...(rentalMatchResult ? { rentalMatchResult } : {}),
           },
         });
 
@@ -921,6 +812,7 @@ export class AiService {
         checklistMutationSummaries,
         checklistClarifications,
         checklistReadReplies,
+        ...(rentalMatchResult ? { rentalMatchResult } : {}),
         providerMeta: patch.providerMeta,
         conversation: {
           ...this.formatConversation(updatedConv),
@@ -930,19 +822,61 @@ export class AiService {
     });
   }
 
+  private hasChecklistAffectingChanged(
+    prev: ValidatedTripState,
+    next: ValidatedTripState,
+  ): boolean {
+    const checklistScalarKeys: Array<keyof ValidatedTripState> = [
+      'activity',
+      'environment',
+      'isOvernight',
+      'durationDays',
+      'travelers',
+    ];
+    for (const k of checklistScalarKeys) {
+      if ((prev[k] ?? null) !== (next[k] ?? null)) {
+        return true;
+      }
+    }
+    const prevGear = [...(prev.ownedGear || [])].sort().join(',');
+    const nextGear = [...(next.ownedGear || [])].sort().join(',');
+    if (prevGear !== nextGear) return true;
+
+    if (
+      JSON.stringify(prev.ownedGearQuantities || {}) !==
+      JSON.stringify(next.ownedGearQuantities || {})
+    ) {
+      return true;
+    }
+    if (
+      JSON.stringify(prev.requiredGearQuantities || {}) !==
+      JSON.stringify(next.requiredGearQuantities || {})
+    ) {
+      return true;
+    }
+    const prevRemoved = [...(prev.removedGearCodes || [])].sort().join(',');
+    const nextRemoved = [...(next.removedGearCodes || [])].sort().join(',');
+    if (prevRemoved !== nextRemoved) return true;
+
+    return (
+      JSON.stringify(prev.customGearItems || []) !==
+      JSON.stringify(next.customGearItems || [])
+    );
+  }
+
   private hasTripStateChanged(
     prev: ValidatedTripState,
     next: ValidatedTripState,
   ): boolean {
+    if (this.hasChecklistAffectingChanged(prev, next)) {
+      return true;
+    }
     const scalarKeys: Array<keyof ValidatedTripState> = [
       'intent',
       'destination',
       'route',
-      'activity',
       'departureDate',
       'endDate',
-      'durationDays',
-      'travelers',
       'experienceLevel',
       'budgetVnd',
       'pickupArea',
@@ -954,25 +888,284 @@ export class AiService {
         return true;
       }
     }
-    const prevGear = [...(prev.ownedGear || [])].sort().join(',');
-    const nextGear = [...(next.ownedGear || [])].sort().join(',');
-    if (prevGear !== nextGear) return true;
+    const prevSec = [...(prev.secondaryActivities || [])].sort().join(',');
+    const nextSec = [...(next.secondaryActivities || [])].sort().join(',');
+    if (prevSec !== nextSec) return true;
 
-    const prevQtys = JSON.stringify(prev.ownedGearQuantities || {});
-    const nextQtys = JSON.stringify(next.ownedGearQuantities || {});
-    if (prevQtys !== nextQtys) return true;
+    const prevSpots = [...(prev.savedSpots || [])].sort().join(',');
+    const nextSpots = [...(next.savedSpots || [])].sort().join(',');
+    return prevSpots !== nextSpots;
+  }
 
-    const prevReqQtys = JSON.stringify(prev.requiredGearQuantities || {});
-    const nextReqQtys = JSON.stringify(next.requiredGearQuantities || {});
-    if (prevReqQtys !== nextReqQtys) return true;
+  private buildSavedSpotsReply(
+    tripState: ValidatedTripState,
+    askedDestination?: string | null,
+  ): string {
+    const spots = tripState.savedSpots || [];
+    if (spots.length > 0) {
+      return [
+        `Theo kế hoạch chuyến đi đã lưu${tripState.destination ? ` tại **${tripState.destination}**` : ''}, các điểm bạn đã chọn gồm:`,
+        ...spots.map((s, i) => `${i + 1}. **${s}**`),
+      ].join('\n');
+    }
 
-    const prevRemoved = [...(prev.removedGearCodes || [])].sort().join(',');
-    const nextRemoved = [...(next.removedGearCodes || [])].sort().join(',');
-    if (prevRemoved !== nextRemoved) return true;
+    if (tripState.destination) {
+      const target = askedDestination || tripState.destination;
+      return `Hiện trong kế hoạch chuyến đi của bạn **mới chỉ lưu điểm đến chính là ${tripState.destination}**${
+        tripState.route ? ` (tuyến: ${tripState.route})` : ''
+      } — **chưa lưu các điểm dừng chân hay địa điểm tham quan cụ thể nào**. Bạn có muốn mình gợi ý một vài điểm ở **${target}** để bạn chọn lưu không?`;
+    }
 
-    const prevCustom = JSON.stringify(prev.customGearItems || []);
-    const nextCustom = JSON.stringify(next.customGearItems || []);
-    return prevCustom !== nextCustom;
+    return 'Hiện kế hoạch chuyến đi của bạn **chưa lưu địa điểm nào**. Bạn có thể nhắn tên nơi muốn đến (ví dụ *"Tôi muốn đi Cát Bà"*) hoặc nhờ mình gợi ý địa điểm trước nhé.';
+  }
+
+  private buildMissingItemsReply(
+    checklistItems: ChecklistEntry[],
+    hasSavedChecklist: boolean,
+  ): string {
+    if (!hasSavedChecklist && checklistItems.length === 0) {
+      return 'Hiện nhóm **chưa có checklist được lưu** nên chưa thể kiểm tra các món còn thiếu. Hãy hoàn thiện địa điểm, hoạt động, số ngày, số người (hoặc bấm **Tạo checklist**) rồi hỏi lại mình nhé.';
+    }
+
+    const missingItems = checklistItems.filter(
+      (i) => Number(i.quantityMissing || 0) > 0,
+    );
+    const unconfirmedItems = checklistItems.filter(
+      (i) => i.ownedConfirmed === false,
+    );
+
+    if (missingItems.length === 0 && unconfirmedItems.length === 0) {
+      return '✅ Theo checklist hiện tại đã lưu, **nhóm đã đủ toàn bộ các hạng mục** (không còn món nào bị thiếu).';
+    }
+
+    const parts: string[] = [
+      '📦 **Các món đang còn thiếu theo checklist hiện tại:**',
+    ];
+
+    const rentableMissing = missingItems.filter((i) => i.canRent !== false);
+    const selfPrepareMissing = missingItems.filter((i) => i.canRent === false);
+
+    if (rentableMissing.length > 0) {
+      parts.push(
+        '**Có thể tìm thuê / mượn trên TravelShare:**\n' +
+          rentableMissing
+            .map((i) => {
+              const req = i.quantityRequired ?? i.quantityNeeded ?? 1;
+              const warn =
+                i.ownedConfirmed === false
+                  ? ' *(chưa xác nhận số đã có)*'
+                  : '';
+              return `- **${i.name}**: thiếu **${i.quantityMissing} ${i.unit}** (cần ${req}, đã có ${i.quantityOwned})${warn}`;
+            })
+            .join('\n'),
+      );
+    }
+
+    if (selfPrepareMissing.length > 0) {
+      parts.push(
+        '**Đồ cá nhân / tiêu hao cần tự chuẩn bị:**\n' +
+          selfPrepareMissing
+            .map((i) => {
+              const req = i.quantityRequired ?? i.quantityNeeded ?? 1;
+              const warn =
+                i.ownedConfirmed === false
+                  ? ' *(chưa xác nhận số đã có)*'
+                  : '';
+              return `- **${i.name}**: thiếu **${i.quantityMissing} ${i.unit}** (cần ${req}, đã có ${i.quantityOwned})${warn}`;
+            })
+            .join('\n'),
+      );
+    }
+
+    if (unconfirmedItems.length > 0) {
+      parts.push(
+        `⚠️ *Lưu ý xác nhận:* Bạn từng nhắc đã có **${unconfirmedItems
+          .map((i) => i.name)
+          .join(', ')}** nhưng chưa chốt số lượng cụ thể, nên hệ thống đang tạm giữ nguyên phần cần chuẩn bị.`,
+      );
+    }
+
+    if (rentableMissing.length > 0) {
+      parts.push(
+        'Bạn có thể nhắn *"Tìm thuê đồ còn thiếu"* hoặc dùng mục **Gợi ý thuê đồ còn thiếu** bên cạnh để xem danh sách thiết bị khả dụng nhé.',
+      );
+    }
+
+    return parts.join('\n\n');
+  }
+
+  private async buildChatRentalMatchReply(params: {
+    userId: string;
+    checklistId: string | null;
+    checklistItems: ChecklistEntry[];
+    tripState: ValidatedTripState;
+  }): Promise<{
+    replyText: string;
+    matchResult: Record<string, any> | null;
+  }> {
+    const { userId, checklistId, checklistItems, tripState } = params;
+
+    if (!checklistId && checklistItems.length === 0) {
+      return {
+        replyText:
+          'Hiện tại nhóm **chưa có checklist được lưu** nên mình chưa có danh sách đồ thiếu để tìm thuê. Bạn hãy hoàn tất thông tin chuyến đi (địa điểm, hoạt động, số ngày, số người) và tạo checklist trước nhé.',
+        matchResult: null,
+      };
+    }
+
+    const rentableMissing = checklistItems.filter(
+      (i) => i.canRent !== false && Number(i.quantityMissing || 0) > 0 && i.ownedConfirmed !== false,
+    );
+    const selfPrepareMissing = checklistItems.filter(
+      (i) => i.canRent === false && Number(i.quantityMissing || 0) > 0,
+    );
+    const unconfirmedRentable = checklistItems.filter(
+      (i) => i.canRent !== false && i.ownedConfirmed === false,
+    );
+
+    if (rentableMissing.length === 0 && unconfirmedRentable.length === 0) {
+      const selfNote =
+        selfPrepareMissing.length > 0
+          ? ` Chỉ còn các món **cần tự chuẩn bị cá nhân** (không cho thuê trên hệ thống): ${selfPrepareMissing
+              .map((i) => `${i.name} (thiếu ${i.quantityMissing} ${i.unit})`)
+              .join(', ')}.`
+          : '';
+      return {
+        replyText: `✅ Checklist hiện tại **không còn hạng mục nào thuộc nhóm có thể thuê đang bị thiếu**.${selfNote}`,
+        matchResult: null,
+      };
+    }
+
+    // Check required rental context before querying inventory
+    const missingRentalPrereqs: string[] = [];
+    if (!tripState.departureDate) missingRentalPrereqs.push('ngày đi / ngày nhận đồ');
+    if (!tripState.pickupArea) missingRentalPrereqs.push('khu vực nhận đồ (ví dụ: Cầu Giấy, Đống Đa - Hà Nội)');
+
+    if (!this.checklistsService || !checklistId || missingRentalPrereqs.length > 0) {
+      const introLines: string[] = [];
+      if (rentableMissing.length > 0) {
+        introLines.push(
+          `**Các món đang thiếu thuộc nhóm có thể tìm thuê (${rentableMissing.length}):** ${rentableMissing
+            .map((i) => `${i.name} (thiếu ${i.quantityMissing} ${i.unit})`)
+            .join(', ')}.`,
+        );
+      }
+      if (selfPrepareMissing.length > 0) {
+        introLines.push(
+          `**Các món thiếu cần tự chuẩn bị (không cho thuê):** ${selfPrepareMissing
+            .map((i) => `${i.name} (${i.quantityMissing} ${i.unit})`)
+            .join(', ')}.`,
+        );
+      }
+      if (unconfirmedRentable.length > 0) {
+        introLines.push(
+          `**Chưa xác nhận số lượng đã có:** ${unconfirmedRentable
+            .map((i) => i.name)
+            .join(', ')} (cần chốt số đang có để tìm thuê đúng phần thiếu).`,
+        );
+      }
+      if (missingRentalPrereqs.length > 0) {
+        introLines.push(
+          `Để hệ thống lọc thiết bị **đang trống lịch và gần bạn nhất**, bạn cho mình biết thêm **${missingRentalPrereqs.join(' và ')}** nhé.`,
+        );
+      }
+      return {
+        replyText: introLines.join('\n\n'),
+        matchResult: null,
+      };
+    }
+
+    const startDateStr = tripState.departureDate!;
+    const endDateStr =
+      tripState.endDate ||
+      (() => {
+        const d = new Date(`${startDateStr}T00:00:00.000Z`);
+        d.setUTCDate(d.getUTCDate() + Math.max(1, tripState.durationDays || 1));
+        return d.toISOString().slice(0, 10);
+      })();
+
+    const matchResult = await this.checklistsService.matchMissingGear(
+      userId,
+      checklistId,
+      {
+        startAt: `${startDateStr}T07:00:00.000+07:00`,
+        endAt: `${endDateStr}T18:00:00.000+07:00`,
+        pickupArea: tripState.pickupArea || undefined,
+        budgetVnd:
+          typeof tripState.budgetVnd === 'number' && tripState.budgetVnd > 0
+            ? tripState.budgetVnd
+            : undefined,
+      },
+    );
+
+    const outLines: string[] = [
+      `🔍 **Kết quả tìm thuê đồ còn thiếu** (${startDateStr} → ${endDateStr}${
+        tripState.pickupArea ? ` • khu vực ${tripState.pickupArea}` : ''
+      }):`,
+    ];
+
+    const matchedCats = Array.isArray(matchResult.itemMatches)
+      ? matchResult.itemMatches
+      : [];
+    if (matchedCats.length > 0) {
+      outLines.push(
+        matchedCats
+          .map((cat: any) => {
+            const top = Array.isArray(cat.candidates)
+              ? cat.candidates[0]
+              : Array.isArray(cat.matchedGear)
+                ? cat.matchedGear[0]
+                : null;
+            if (!top) {
+              return `- **${cat.name}** (thiếu ${cat.quantityMissing} ${cat.unit}): ${cat.unmatchedReason || 'Chưa tìm thấy tin đăng phù hợp.'}`;
+            }
+            const avail =
+              top.availableQuantity ?? top.availableUnitsInWindow ?? top.fulfillableQuantity ?? 1;
+            return `- **${cat.name}** (thiếu ${cat.quantityMissing} ${cat.unit}): Gợi ý **${top.title}** — **${Number(top.pricePerDay || 0).toLocaleString('vi-VN')} ₫/ngày** (${top.district || ''}${top.city ? `, ${top.city}` : ''}, còn trống ${avail}/${cat.quantityMissing}).`;
+          })
+          .join('\n'),
+      );
+    }
+
+    const unmatchedCats = Array.isArray(matchResult.unmatchedItems)
+      ? matchResult.unmatchedItems
+      : [];
+    if (unmatchedCats.length > 0) {
+      outLines.push(
+        '**Chưa tìm thấy đồ cho thuê phù hợp trên hệ thống:**\n' +
+          unmatchedCats
+            .map(
+              (u: any) =>
+                `- **${u.name}** (thiếu ${u.quantityMissing}): ${u.unmatchedReason || u.reason || 'Không tìm thấy thiết bị phù hợp.'}`,
+            )
+            .join('\n'),
+      );
+    }
+
+    if (selfPrepareMissing.length > 0) {
+      outLines.push(
+        `**Các món cần tự chuẩn bị cá nhân (không tìm thuê):** ${selfPrepareMissing
+          .map((i) => `${i.name} (${i.quantityMissing} ${i.unit})`)
+          .join(', ')}.`,
+      );
+    }
+
+    if (unconfirmedRentable.length > 0) {
+      outLines.push(
+        `⚠️ Chưa tìm thuê cho **${unconfirmedRentable
+          .map((i) => i.name)
+          .join(', ')}** vì bạn chưa xác nhận số lượng thực tế đang có.`,
+      );
+    }
+
+    if (matchResult.budgetSummary?.statusLabel) {
+      outLines.push(`💰 *Tình trạng ngân sách:* ${matchResult.budgetSummary.statusLabel}.`);
+    }
+
+    return {
+      replyText: outLines.join('\n\n'),
+      matchResult,
+    };
   }
 
   private buildChecklistReadReplies(
@@ -1103,6 +1296,8 @@ export class AiService {
     const didTripScaleOrActivityChange =
       !prevChecklistDoc ||
       prevTripState.activity !== tripState.activity ||
+      (prevTripState.environment ?? null) !== (tripState.environment ?? null) ||
+      (prevTripState.isOvernight ?? null) !== (tripState.isOvernight ?? null) ||
       prevTripState.travelers !== tripState.travelers ||
       prevTripState.durationDays !== tripState.durationDays;
 
@@ -1144,6 +1339,8 @@ export class AiService {
     if (didTripScaleOrActivityChange || clearedOwnedGear) {
       baseItems = buildChecklistEntriesFromRules({
         activity,
+        environment: tripState.environment || null,
+        isOvernight: tripState.isOvernight ?? null,
         durationDays,
         travelers,
         ownedGearCodes: tripState.ownedGear || [],
@@ -1228,6 +1425,9 @@ export class AiService {
       destination: tripState.destination || 'Việt Nam',
       route: tripState.route || null,
       activity,
+      environment: tripState.environment || null,
+      isOvernight: tripState.isOvernight ?? null,
+      secondaryActivities: tripState.secondaryActivities || [],
       departureDate: tripState.departureDate
         ? new Date(`${tripState.departureDate}T00:00:00.000Z`)
         : undefined,

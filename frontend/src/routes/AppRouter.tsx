@@ -17,6 +17,7 @@ import { NotificationsPage } from '../pages/NotificationsPage';
 import { AiAssistantPage } from '../pages/AiAssistantPage';
 import { LoginPage } from '../pages/LoginPage';
 import { RegisterPage } from '../pages/RegisterPage';
+import { GoogleCallbackPage } from '../pages/GoogleCallbackPage';
 import { ForgotPasswordPage } from '../pages/ForgotPasswordPage';
 import { ProfileSettingsPage } from '../pages/ProfileSettingsPage';
 import { CommunitiesPage } from '../pages/CommunitiesPage';
@@ -51,6 +52,7 @@ export const AppRouter: React.FC = () => {
           <Route path="/admin" element={<AdminDashboardPage />} />
           <Route path="/login" element={<LoginPage />} />
           <Route path="/register" element={<RegisterPage />} />
+          <Route path="/auth/google/callback" element={<GoogleCallbackPage />} />
           <Route path="/forgot-password" element={<ForgotPasswordPage />} />
           <Route path="/settings/profile" element={<ProfileSettingsPage />} />
           <Route path="*" element={<Navigate to="/feed" replace />} />

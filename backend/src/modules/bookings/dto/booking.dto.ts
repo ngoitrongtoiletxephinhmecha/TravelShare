@@ -6,6 +6,7 @@ import {
   IsEnum,
   IsInt,
   IsNotEmpty,
+  IsNumber,
   IsOptional,
   IsString,
   Max,
@@ -17,6 +18,7 @@ import {
   DisputeReason,
   DisputeStatus,
   GearCondition,
+  GearListingType,
 } from '../../../common/enums/system.enums';
 
 export class CreateBookingDto {
@@ -48,6 +50,32 @@ export class CreateBookingDto {
   @IsString()
   @MaxLength(1000)
   renterNote?: string;
+
+  @ApiPropertyOptional({
+    description: 'Giá thuê/ngày snapshot từ bước matching để phát hiện thay đổi giá',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  expectedPricePerDay?: number;
+
+  @ApiPropertyOptional({
+    description: 'Tiền cọc/chiếc snapshot từ bước matching để phát hiện thay đổi cọc',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  expectedDepositAmount?: number;
+
+  @ApiPropertyOptional({
+    enum: GearListingType,
+    description: 'Hình thức chia sẻ snapshot từ bước matching',
+  })
+  @IsOptional()
+  @IsEnum(GearListingType)
+  expectedSharingType?: GearListingType;
 }
 
 export class ApproveBookingDto {
@@ -58,6 +86,15 @@ export class ApproveBookingDto {
   @IsString()
   @MaxLength(1000)
   note?: string;
+
+  @ApiPropertyOptional({
+    description: 'Ghi chú nội bộ chỉ chủ thiết bị và Admin được phép xem',
+    example: 'Kiểm tra lại dây kéo trước khi giao khách',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(1000)
+  internalNote?: string;
 }
 
 export class RejectBookingDto {

@@ -41,6 +41,21 @@ export const GearDetailPage: React.FC = () => {
   const paramEndAt = searchParams.get('endAt')?.slice(0, 10) || '';
   const paramQty = Number(searchParams.get('quantity') || 0);
   const paramOpenBooking = searchParams.get('openBooking') === '1';
+  const paramSharingType = searchParams.get('sharingType') as
+    | 'RENT'
+    | 'FREE_LOAN'
+    | 'BOTH'
+    | null;
+  const rawExpectedPrice = searchParams.get('expectedPricePerDay');
+  const rawExpectedDeposit = searchParams.get('expectedDepositAmount');
+  const paramExpectedPricePerDay =
+    rawExpectedPrice !== null && rawExpectedPrice !== '' && !isNaN(Number(rawExpectedPrice))
+      ? Number(rawExpectedPrice)
+      : undefined;
+  const paramExpectedDepositAmount =
+    rawExpectedDeposit !== null && rawExpectedDeposit !== '' && !isNaN(Number(rawExpectedDeposit))
+      ? Number(rawExpectedDeposit)
+      : undefined;
 
   const [checkStart, setCheckStart] = useState(paramStartAt || '2026-12-01');
   const [checkEnd, setCheckEnd] = useState(paramEndAt || '2026-12-03');
@@ -780,6 +795,9 @@ export const GearDetailPage: React.FC = () => {
         initialStartDate={checkStart}
         initialEndDate={checkEnd}
         initialQuantity={checkQty}
+        expectedPricePerDay={paramExpectedPricePerDay}
+        expectedDepositAmount={paramExpectedDepositAmount}
+        expectedSharingType={paramSharingType || undefined}
       />
 
       <ReportModal

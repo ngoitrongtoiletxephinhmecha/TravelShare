@@ -4,6 +4,7 @@ import {
   ActivityType,
   ChecklistPriority,
   ExperienceLevel,
+  TripEnvironment,
 } from '../../common/enums/system.enums';
 
 export type AiConversationStatus =
@@ -21,6 +22,10 @@ export interface ValidatedTripState {
   destination: string | null;
   route: string | null;
   activity: ActivityType | null;
+  environment?: TripEnvironment | null;
+  isOvernight?: boolean | null;
+  secondaryActivities?: ActivityType[];
+  savedSpots?: string[];
   departureDate: string | null;
   endDate: string | null;
   durationDays: number | null;
@@ -163,6 +168,15 @@ export class TravelPlan {
 
   @Prop({ type: String, enum: ActivityType, required: true })
   activity: ActivityType;
+
+  @Prop({ type: String, default: null })
+  environment?: TripEnvironment | null;
+
+  @Prop({ type: Boolean, default: null })
+  isOvernight?: boolean | null;
+
+  @Prop({ type: [String], default: [] })
+  secondaryActivities?: ActivityType[];
 
   @Prop()
   departureDate?: Date;

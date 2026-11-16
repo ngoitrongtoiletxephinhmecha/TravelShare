@@ -455,6 +455,14 @@ export class SearchGearQueryDto {
   @IsString()
   endAt?: string;
 
+  @ApiPropertyOptional({ description: 'Số lượng tối thiểu cần còn trống', default: 1 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(50)
+  quantity?: number;
+
   @ApiPropertyOptional({
     enum: ['newest', 'price_asc', 'price_desc', 'distance'],
     default: 'newest',

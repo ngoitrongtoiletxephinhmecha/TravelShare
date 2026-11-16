@@ -7,23 +7,61 @@ import {
   WebSocketGateway,
   WebSocketServer,
 } from '@nestjs/websockets';
-import { Logger, OnModuleInit } from '@nestjs/common';
+import { Logger, OnModuleInit, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model } from 'mongoose';
 import { Server, Socket } from 'socket.io';
 import { ChatsService } from './chats.service';
 import { NotificationsService } from '../notifications/notifications.service';
+import {
+  AuthEventsService,
+  SessionRevocationEvent,
+} from '../auth/auth-events.service';
+import { User, UserDocument } from '../../database/schemas';
+import { AccountStatus } from '../../common/enums/system.enums';
+import { parseAllowedOrigins } from '../../config/configuration';
 import { SendMessageDto } from './dto/chat.dto';
 
 export interface AuthenticatedSocketUser {
   userId: string;
   email: string;
   role: string;
+  sessionId?: string;
 }
+
+type SocketAuthFailureCode =
+  | 'UNAUTHORIZED'
+  | 'ACCOUNT_LOCKED'
+  | 'SESSION_REVOKED'
+  | 'SESSION_EXPIRED';
 
 @WebSocketGateway({
   cors: {
-    origin: true,
+    origin: (
+      origin: string | undefined,
+      callback: (err: Error | null, allow?: boolean) => void,
+    ) => {
+      if (!origin) return callback(null, true);
+      const isProd = process.env.NODE_ENV === 'production';
+      const allowed = parseAllowedOrigins(
+        process.env.FRONTEND_URL || 'http://localhost:5173',
+        process.env.CORS_ORIGINS,
+        isProd,
+      );
+      const normalized = origin.replace(/\/+$/, '');
+      if (allowed.includes(normalized)) {
+        return callback(null, true);
+      }
+      if (
+        !isProd &&
+        /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(normalized)
+      ) {
+        return callback(null, true);
+      }
+      return callback(new Error(`Origin ${origin} không được phép qua Socket.IO`), false);
+    },
     credentials: true,
   },
 })
@@ -40,6 +78,11 @@ export class RealtimeGateway
     private readonly configService: ConfigService,
     private readonly chatsService: ChatsService,
     private readonly notificationsService: NotificationsService,
+    @Optional()
+    @InjectModel(User.name)
+    private readonly userModel?: Model<UserDocument>,
+    @Optional()
+    private readonly authEventsService?: AuthEventsService,
   ) {}
 
   onModuleInit() {
@@ -48,69 +91,191 @@ export class RealtimeGateway
         this.emitNotificationToUser(recipientId, notification);
       },
     );
+
+    this.authEventsService?.onSessionRevoked(async (event) => {
+      await this.disconnectRevokedSockets(event);
+    });
   }
 
-  /**
-   * Extract & verify JWT token from Socket.IO handshake (auth.token, Authorization header, or cookie)
-   */
-  async authenticateClient(
-    client: Socket,
-  ): Promise<AuthenticatedSocketUser | null> {
-    if (client.data?.user?.userId) {
-      return client.data.user as AuthenticatedSocketUser;
-    }
-
+  private extractSocketToken(client: Socket): string | null {
     const rawAuthToken = client.handshake?.auth?.token;
     const rawHeader = client.handshake?.headers?.authorization;
     const rawCookie = client.handshake?.headers?.cookie || '';
 
-    let token: string | null = null;
     if (typeof rawAuthToken === 'string' && rawAuthToken.trim()) {
-      token = rawAuthToken.replace(/^Bearer\s+/i, '').trim();
-    } else if (typeof rawHeader === 'string' && rawHeader.startsWith('Bearer ')) {
-      token = rawHeader.slice(7).trim();
-    } else if (rawCookie.includes('ts_access_token=')) {
+      return rawAuthToken.replace(/^Bearer\s+/i, '').trim();
+    }
+    if (typeof rawHeader === 'string' && rawHeader.startsWith('Bearer ')) {
+      return rawHeader.slice(7).trim();
+    }
+    if (rawCookie.includes('ts_access_token=')) {
       const match = rawCookie.match(/ts_access_token=([^;]+)/);
       if (match?.[1]) {
-        token = decodeURIComponent(match[1]);
+        return decodeURIComponent(match[1]);
       }
     }
+    return null;
+  }
 
+  private async verifyClientSession(client: Socket): Promise<{
+    user: AuthenticatedSocketUser | null;
+    failureCode?: SocketAuthFailureCode;
+    failureMessage?: string;
+  }> {
+    const token = this.extractSocketToken(client);
     if (!token) {
-      return null;
+      return {
+        user: null,
+        failureCode: 'UNAUTHORIZED',
+        failureMessage: 'Phiên kết nối Socket.IO chưa được xác thực',
+      };
     }
 
+    let payload: any;
     try {
       const secret =
         this.configService.get<string>('jwt.accessSecret') ||
-        'dev-access-secret-key-change-in-production-32chars';
-      const payload = await this.jwtService.verifyAsync(token, { secret });
-      if (!payload?.sub) {
-        return null;
+        process.env.JWT_ACCESS_SECRET ||
+        (process.env.NODE_ENV !== 'production'
+          ? 'dev-access-secret-key-change-in-production-32chars'
+          : '');
+      payload = await this.jwtService.verifyAsync(token, { secret });
+    } catch (err: any) {
+      const isExpired =
+        err?.name === 'TokenExpiredError' ||
+        /expired/i.test(String(err?.message || ''));
+      return {
+        user: null,
+        failureCode: isExpired ? 'SESSION_EXPIRED' : 'UNAUTHORIZED',
+        failureMessage: isExpired
+          ? 'Token phiên đăng nhập đã hết hạn'
+          : 'Token phiên kết nối không hợp lệ',
+      };
+    }
+
+    if (!payload?.sub) {
+      return {
+        user: null,
+        failureCode: 'UNAUTHORIZED',
+        failureMessage: 'Token không hợp lệ',
+      };
+    }
+
+    if (this.userModel) {
+      const dbUser: any = await this.userModel
+        .findById(payload.sub)
+        .select('status role email +refreshSessions')
+        .lean();
+
+      if (!dbUser) {
+        return {
+          user: null,
+          failureCode: 'UNAUTHORIZED',
+          failureMessage: 'Tài khoản không tồn tại',
+        };
       }
 
-      const authUser: AuthenticatedSocketUser = {
-        userId: String(payload.sub),
-        email: String(payload.email || ''),
-        role: String(payload.role || 'USER'),
-      };
-      client.data = client.data || {};
-      client.data.user = authUser;
-      return authUser;
-    } catch {
+      if (dbUser.status !== AccountStatus.ACTIVE) {
+        return {
+          user: null,
+          failureCode: 'ACCOUNT_LOCKED',
+          failureMessage: `Tài khoản hiện đang ở trạng thái ${dbUser.status}. Kết nối realtime đã bị ngắt.`,
+        };
+      }
+
+      if (payload.sessionId && Array.isArray(dbUser.refreshSessions)) {
+        const now = new Date();
+        const activeSession = dbUser.refreshSessions.some(
+          (s: any) =>
+            s.sessionId === payload.sessionId &&
+            (!s.expiresAt || new Date(s.expiresAt) > now),
+        );
+        if (!activeSession) {
+          return {
+            user: null,
+            failureCode: 'SESSION_REVOKED',
+            failureMessage:
+              'Phiên đăng nhập đã bị thu hồi hoặc đăng xuất. Vui lòng đăng nhập lại.',
+          };
+        }
+      }
+    }
+
+    const authUser: AuthenticatedSocketUser = {
+      userId: String(payload.sub),
+      email: String(payload.email || ''),
+      role: String(payload.role || 'USER'),
+      sessionId: payload.sessionId ? String(payload.sessionId) : undefined,
+    };
+    client.data = client.data || {};
+    client.data.user = authUser;
+
+    return { user: authUser };
+  }
+
+  /**
+   * Re-verify active JWT, account status, and session revocation on every connect and message event.
+   */
+  async authenticateClient(
+    client: Socket,
+  ): Promise<AuthenticatedSocketUser | null> {
+    const check = await this.verifyClientSession(client);
+    if (!check.user) {
+      client.emit('auth:error', {
+        status: 'ERROR',
+        code: check.failureCode || 'UNAUTHORIZED',
+        message: check.failureMessage || 'Phiên kết nối không hợp lệ',
+      });
+      client.disconnect(true);
       return null;
     }
+    return check.user;
+  }
+
+  async disconnectRevokedSockets(
+    event: SessionRevocationEvent,
+  ): Promise<number> {
+    if (!this.server) return 0;
+    const room = `user:${String(event.userId)}`;
+    let disconnected = 0;
+
+    try {
+      const sockets = await this.server.in(room).fetchSockets();
+      const code: SocketAuthFailureCode =
+        event.reason === 'ACCOUNT_LOCKED'
+          ? 'ACCOUNT_LOCKED'
+          : 'SESSION_REVOKED';
+      const message =
+        event.reason === 'ACCOUNT_LOCKED'
+          ? 'Tài khoản của bạn đã bị khóa bởi quản trị viên.'
+          : 'Phiên đăng nhập của bạn đã bị đăng xuất hoặc thu hồi.';
+
+      for (const sock of sockets) {
+        const sockSessionId = sock.data?.user?.sessionId;
+        if (event.sessionId && sockSessionId && sockSessionId !== event.sessionId) {
+          continue;
+        }
+        sock.emit('auth:error', {
+          status: 'ERROR',
+          code,
+          reason: event.reason,
+          message,
+        });
+        sock.disconnect(true);
+        disconnected += 1;
+      }
+    } catch (err) {
+      this.logger.warn(
+        `Failed to disconnect revoked sockets for user=${event.userId}: ${String(err)}`,
+      );
+    }
+
+    return disconnected;
   }
 
   async handleConnection(client: Socket) {
     const authUser = await this.authenticateClient(client);
     if (!authUser) {
-      client.emit('auth:error', {
-        status: 'ERROR',
-        code: 'UNAUTHORIZED',
-        message: 'Phiên kết nối Socket.IO chưa được xác thực',
-      });
-      client.disconnect(true);
       return;
     }
 
@@ -130,26 +295,32 @@ export class RealtimeGateway
   }
 
   /**
-   * Join a conversation room after verifying membership
+   * Join a conversation room after verifying active session and membership
    */
   @SubscribeMessage('conversation:join')
   async handleJoinConversation(
     @ConnectedSocket() client: Socket,
     @MessageBody() payload: { conversationId: string },
   ) {
-    const authUser = await this.authenticateClient(client);
-    if (!authUser) {
+    const check = await this.verifyClientSession(client);
+    if (!check.user) {
+      client.emit('auth:error', {
+        status: 'ERROR',
+        code: check.failureCode || 'UNAUTHORIZED',
+        message: check.failureMessage,
+      });
+      client.disconnect(true);
       return {
         status: 'ERROR',
-        code: 'UNAUTHORIZED',
-        message: 'Vui lòng đăng nhập để tham gia hội thoại',
+        code: check.failureCode || 'UNAUTHORIZED',
+        message: check.failureMessage || 'Vui lòng đăng nhập để tham gia hội thoại',
       };
     }
 
     try {
       const conv = await this.chatsService.getConversationById(
         payload?.conversationId,
-        authUser.userId,
+        check.user.userId,
       );
       await client.join(`conversation:${conv.id}`);
       return {
@@ -167,8 +338,8 @@ export class RealtimeGateway
 
   /**
    * Send message over Socket.IO:
-   * 1. Authenticate sender from socket session
-   * 2. Persist idempotently in MongoDB (`clientMessageId`)
+   * 1. Re-verify active session & account status
+   * 2. Persist idempotently in MongoDB (`clientMessageId`) after checking conversation membership
    * 3. Emit `message:new` to recipient(s) & conversation room
    * 4. Return ACK to sender
    */
@@ -178,19 +349,25 @@ export class RealtimeGateway
     @MessageBody()
     payload: SendMessageDto & { conversationId: string },
   ) {
-    const authUser = await this.authenticateClient(client);
-    if (!authUser) {
+    const check = await this.verifyClientSession(client);
+    if (!check.user) {
+      client.emit('auth:error', {
+        status: 'ERROR',
+        code: check.failureCode || 'UNAUTHORIZED',
+        message: check.failureMessage,
+      });
+      client.disconnect(true);
       return {
         status: 'ERROR',
-        code: 'UNAUTHORIZED',
-        message: 'Phiên kết nối không hợp lệ',
+        code: check.failureCode || 'UNAUTHORIZED',
+        message: check.failureMessage || 'Phiên kết nối không hợp lệ',
       };
     }
 
     try {
       const result = await this.chatsService.sendMessage(
         payload.conversationId,
-        authUser.userId,
+        check.user.userId,
         {
           content: payload.content,
           clientMessageId: payload.clientMessageId,
@@ -204,7 +381,7 @@ export class RealtimeGateway
           payload.conversationId,
           result.message,
           result.recipientIds,
-          authUser.userId,
+          check.user.userId,
         );
       }
 
@@ -232,19 +409,25 @@ export class RealtimeGateway
     @MessageBody()
     payload: { conversationId: string; lastReadMessageId?: string },
   ) {
-    const authUser = await this.authenticateClient(client);
-    if (!authUser) {
+    const check = await this.verifyClientSession(client);
+    if (!check.user) {
+      client.emit('auth:error', {
+        status: 'ERROR',
+        code: check.failureCode || 'UNAUTHORIZED',
+        message: check.failureMessage,
+      });
+      client.disconnect(true);
       return {
         status: 'ERROR',
-        code: 'UNAUTHORIZED',
-        message: 'Phiên kết nối không hợp lệ',
+        code: check.failureCode || 'UNAUTHORIZED',
+        message: check.failureMessage || 'Phiên kết nối không hợp lệ',
       };
     }
 
     try {
       const receipt = await this.chatsService.markConversationRead(
         payload.conversationId,
-        authUser.userId,
+        check.user.userId,
         { lastReadMessageId: payload.lastReadMessageId },
       );
 

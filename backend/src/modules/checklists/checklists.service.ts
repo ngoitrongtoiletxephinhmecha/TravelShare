@@ -4,7 +4,9 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import {
@@ -35,8 +37,12 @@ import {
   GearListingType,
   GearModerationStatus,
   GearStatus,
+  normalizeLegacyActivity,
 } from '../../common/enums/system.enums';
-import { AvailabilityService } from '../gear/availability.service';
+import {
+  AvailabilityService,
+  HOLDING_BOOKING_STATUSES,
+} from '../gear/availability.service';
 import {
   AddChecklistItemDto,
   MatchChecklistGearDto,
@@ -257,6 +263,8 @@ export class ChecklistsService {
     @InjectModel(Profile.name)
     private readonly profileModel: Model<ProfileDocument>,
     private readonly availabilityService: AvailabilityService,
+    @Optional()
+    private readonly configService?: ConfigService,
   ) {}
 
   private assertPlanOwnership(
@@ -331,7 +339,9 @@ export class ChecklistsService {
    */
   async buildChecklistEntriesForPlan(
     plan: {
-      activity: ActivityType;
+      activity: ActivityType | string;
+      environment?: string | null;
+      isOvernight?: boolean | null;
       durationDays: number;
       travelers: number;
       ownedGearCodes?: string[];
@@ -352,12 +362,12 @@ export class ChecklistsService {
       didTravelersChange?: boolean;
     },
   ): Promise<ChecklistEntry[]> {
-    const rawActivity = plan.activity || ActivityType.TREKKING;
-    const effectiveActivity =
-      rawActivity === ActivityType.CAMPING ||
-      rawActivity === ActivityType.BEACH_CAMPING
-        ? ActivityType.CAMPING
-        : ActivityType.TREKKING;
+    const normalized = normalizeLegacyActivity(
+      plan.activity || ActivityType.TREKKING,
+      plan.environment,
+    );
+    const effectiveActivity = normalized.activity || ActivityType.OTHER;
+    const effectiveEnvironment = normalized.environment;
 
     const dbRules = await this.gearRuleModel
       .find({ activity: effectiveActivity })
@@ -372,6 +382,8 @@ export class ChecklistsService {
 
     return buildChecklistEntriesFromRules({
       activity: effectiveActivity,
+      environment: effectiveEnvironment,
+      isOvernight: plan.isOvernight ?? null,
       durationDays: plan.durationDays,
       travelers: plan.travelers,
       ownedGearCodes: plan.ownedGearCodes || [],
@@ -489,6 +501,8 @@ export class ChecklistsService {
     const nextItems = await this.buildChecklistEntriesForPlan(
       {
         activity: plan.activity,
+        environment: (plan as any).environment ?? null,
+        isOvernight: (plan as any).isOvernight ?? null,
         durationDays: plan.durationDays,
         travelers: plan.travelers,
         ownedGearCodes: plan.ownedGearCodes || [],
@@ -1222,56 +1236,236 @@ export class ChecklistsService {
       )
       .map((item: any) => normalizeChecklistEntry(item));
 
-    // Only match items with canRent === true AND quantityMissing > 0
+    if (
+      dto.expectedChecklistVersion !== undefined &&
+      Number(checklist.checklistVersion || 1) !==
+        Number(dto.expectedChecklistVersion)
+    ) {
+      throw new ConflictException({
+        code: 'CHECKLIST_VERSION_STALE',
+        message:
+          'Checklist vừa được cập nhật lên phiên bản mới hơn. Vui lòng tải lại checklist và thử tìm thiết bị lại.',
+      });
+    }
+
+    // Only match items with canRent === true, ownedConfirmed !== false, AND quantityMissing > 0
     const neededRentableItems = allItems.filter(
-      (i) => i.canRent && i.quantityMissing > 0,
+      (i) => i.canRent && i.ownedConfirmed !== false && i.quantityMissing > 0,
     );
     const nonRentableItems = allItems.filter((i) => !i.canRent);
     const unconfirmedOwnedItems = allItems.filter(
-      (i) => i.canRent && !i.ownedConfirmed,
+      (i) => i.canRent && i.ownedConfirmed === false,
     );
 
-    const itemMatches: Array<Record<string, any>> = [];
-    const unmatchedItems: Array<Record<string, any>> = [];
+    const neededCategoryCodes = Array.from(
+      new Set(
+        neededRentableItems.map((i) => String(i.categoryCode).toUpperCase()),
+      ),
+    );
+
+    const isProduction = Boolean(
+      this.configService?.get<boolean>('isProduction') ||
+        this.configService?.get<string>('nodeEnv') === 'production' ||
+        process.env.NODE_ENV === 'production',
+    );
+
+    // 4. Batched DB push-down (single query across all needed categories, excluding renter's own items)
+    let allCandidateGearRaw: any[] = [];
+    if (neededCategoryCodes.length > 0) {
+      const gearFilter: Record<string, any> = {
+        categoryCode:
+          neededCategoryCodes.length === 1
+            ? neededCategoryCodes[0]
+            : { $in: neededCategoryCodes },
+        ownerId: { $ne: new Types.ObjectId(String(currentUserId)) },
+        status: GearStatus.ACTIVE,
+        moderationStatus: GearModerationStatus.APPROVED,
+        isActive: true,
+        ...(isProduction ? { isDemo: { $ne: true } } : {}),
+      };
+
+      if (dto.sharingType === GearListingType.FREE_LOAN) {
+        gearFilter.$or = [
+          { sharingType: GearListingType.FREE_LOAN },
+          { sharingType: GearListingType.BOTH },
+          { pricePerDay: 0 },
+        ];
+      } else if (dto.sharingType === GearListingType.RENT) {
+        gearFilter.sharingType = {
+          $in: [GearListingType.RENT, GearListingType.BOTH],
+        };
+      }
+
+      const gearQuery = this.gearItemModel.find(gearFilter);
+      if (typeof (gearQuery as any).sort === 'function') {
+        (gearQuery as any).sort({ pricePerDay: 1, ratingAvg: -1, _id: 1 });
+      }
+      allCandidateGearRaw = await gearQuery.lean();
+    }
+
+    // Defensive filter against non-eligible / renter-owned items even under simple mocks
+    const eligibleListings = (allCandidateGearRaw || []).filter(
+      (g: any) =>
+        String(g.ownerId) !== String(currentUserId) &&
+        this.availabilityService.isGearEligibleForBooking(g).eligible,
+    );
+
+    // Preload all owner profiles and all overlapping schedules in batch (eliminates N+1 queries)
+    const distinctOwnerIds = Array.from(
+      new Set(eligibleListings.map((g: any) => String(g.ownerId))),
+    ).map((id) => new Types.ObjectId(id));
+
+    const allGearObjIds = eligibleListings.map((g: any) => g._id);
+
+    const [profiles, allOverlappingBlocks, allActiveBookings] =
+      await Promise.all([
+        distinctOwnerIds.length > 0
+          ? this.profileModel
+              .find({ userId: { $in: distinctOwnerIds } })
+              .lean()
+          : Promise.resolve([]),
+        allGearObjIds.length > 0
+          ? this.availabilityModel
+              .find({
+                gearId: { $in: allGearObjIds },
+                startAt: { $lt: end },
+                endAt: { $gt: start },
+              })
+              .lean()
+          : Promise.resolve([]),
+        allGearObjIds.length > 0
+          ? this.bookingModel
+              .find({
+                gearId: { $in: allGearObjIds },
+                status: { $in: HOLDING_BOOKING_STATUSES },
+                startAt: { $lt: end },
+                endAt: { $gt: start },
+              })
+              .lean()
+          : Promise.resolve([]),
+      ]);
+
+    const profileMap = new Map<string, any>();
+    for (const p of profiles) {
+      profileMap.set(String(p.userId), p);
+    }
+
+    const blocksByGearId = new Map<string, any[]>();
+    for (const blk of allOverlappingBlocks || []) {
+      const k = String(blk.gearId);
+      const arr = blocksByGearId.get(k) || [];
+      arr.push(blk);
+      blocksByGearId.set(k, arr);
+    }
+
+    const bookingsByGearId = new Map<string, any[]>();
+    const bookingStatusesById = new Map<string, BookingStatus>();
+    for (const bk of allActiveBookings || []) {
+      const k = String(bk.gearId);
+      const arr = bookingsByGearId.get(k) || [];
+      arr.push(bk);
+      bookingsByGearId.set(k, arr);
+      bookingStatusesById.set(String(bk._id), bk.status);
+    }
+
+    const extraBookedIds: string[] = Array.from(
+      new Set(
+        (allOverlappingBlocks || [])
+          .filter(
+            (b: any) =>
+              b.reason === 'BOOKED' &&
+              b.bookingId &&
+              !bookingStatusesById.has(String(b.bookingId)),
+          )
+          .map((b: any) => String(b.bookingId)),
+      ),
+    );
+    if (extraBookedIds.length > 0) {
+      const extraDocs = await this.bookingModel
+        .find({ _id: { $in: extraBookedIds.map((id) => new Types.ObjectId(id)) } })
+        .lean();
+      for (const d of extraDocs) {
+        bookingStatusesById.set(String(d._id), d.status);
+      }
+    }
+
+    // Compute per-gear availableQuantity ONCE via 9B sweep-line peak occupancy
+    const listingsByCategory = new Map<string, any[]>();
+    const availableByGearId = new Map<string, number>();
+
+    for (const gear of eligibleListings) {
+      const gIdStr = String(gear._id);
+      const { peakReserved } =
+        this.availabilityService.computePeakOccupancyInInterval({
+          reqStart: start,
+          reqEnd: end,
+          availabilityPeriods: blocksByGearId.get(gIdStr) || [],
+          holdingBookings: bookingsByGearId.get(gIdStr) || [],
+          bookingStatusesById,
+        });
+      const totalQty = Math.max(1, Number(gear.totalQuantity) || 1);
+      availableByGearId.set(gIdStr, Math.max(0, totalQty - peakReserved));
+
+      const catCode = String(gear.categoryCode).toUpperCase();
+      const list = listingsByCategory.get(catCode) || [];
+      list.push(gear);
+      listingsByCategory.set(catCode, list);
+    }
+
+    // Pre-build per-item candidate evaluations and split multi-size demands
+    interface ItemDemandEvaluation {
+      item: ChecklistEntry;
+      categoryCode: string;
+      sizeDemands: Array<{
+        sizeLabel: string | null;
+        allowedSizes: string[] | null;
+        qtyNeeded: number;
+      }>;
+      passingCandidates: Array<Record<string, any>>;
+      totalInCategory: number;
+      passedAreaCount: number;
+      missingCoordinatesCount: number;
+      passedAttributesCount: number;
+      passedScheduleCount: number;
+      passedSharingAndBudgetCount: number;
+    }
+
+    const itemEvaluations: ItemDemandEvaluation[] = [];
 
     for (const item of neededRentableItems) {
       const categoryCode = String(item.categoryCode).toUpperCase();
+      const categoryListings = listingsByCategory.get(categoryCode) || [];
+      const sizeDemands = this.parseItemSizeDemands(item);
+      const requiredSizesAll = Array.from(
+        new Set(
+          sizeDemands.flatMap((sd) => sd.allowedSizes || []).filter(Boolean),
+        ),
+      );
 
-      // Fetch all public active listings in this category
-      const categoryListings = await this.gearItemModel
-        .find({
-          categoryCode,
-          status: GearStatus.ACTIVE,
-          moderationStatus: GearModerationStatus.APPROVED,
-          isActive: true,
-        })
-        .lean();
+      const reqAttrs = item.requiredAttributes || {};
+      const minRequiredCapacity = Number(
+        reqAttrs.minCapacityPersons ??
+          reqAttrs.capacityPersons ??
+          reqAttrs.capacity ??
+          0,
+      );
+      const minRequiredVolume = Number(
+        reqAttrs.minVolumeLiters ?? reqAttrs.volumeLiters ?? 0,
+      );
 
       const totalInCategory = categoryListings.length;
       let passedAreaCount = 0;
+      let missingCoordinatesCount = 0;
       let passedAttributesCount = 0;
       let passedScheduleCount = 0;
       let passedSharingAndBudgetCount = 0;
 
       const passingCandidates: Array<Record<string, any>> = [];
 
-      // Preload owner profiles for candidate cards
-      const ownerIds = Array.from(
-        new Set(categoryListings.map((g: any) => String(g.ownerId))),
-      ).map((id) => new Types.ObjectId(id));
-      const profiles =
-        ownerIds.length > 0
-          ? await this.profileModel
-              .find({ userId: { $in: ownerIds } })
-              .lean()
-          : [];
-      const profileMap = new Map<string, any>();
-      for (const p of profiles) {
-        profileMap.set(String(p.userId), p);
-      }
+      for (const gear of categoryListings) {
+        const gIdStr = String(gear._id);
 
-      for (const gear of categoryListings as any[]) {
-        // Filter 1: Area / Geo radius
+        // Filter 1: Area & Geo radius (explicit rule for listings missing coordinates)
         const gearAreaText = this.normalizeViText(
           `${gear.district || ''} ${gear.city || ''}`,
         );
@@ -1294,20 +1488,33 @@ export class ChecklistsService {
           }
         }
 
-        if (
-          hasGeoFilter &&
-          Array.isArray(gear.pickupLocation?.coordinates) &&
-          gear.pickupLocation.coordinates.length === 2
-        ) {
-          const [gearLng, gearLat] = gear.pickupLocation.coordinates;
-          distanceKm = this.calculateDistanceKm(
-            dto.lat!,
-            dto.lng!,
-            gearLat,
-            gearLng,
-          );
-          if (areaTokens.length === 0 && distanceKm > radiusKm) {
+        if (hasGeoFilter) {
+          const coords = gear.pickupLocation?.coordinates;
+          const hasValidCoords =
+            Array.isArray(coords) &&
+            coords.length === 2 &&
+            typeof coords[0] === 'number' &&
+            typeof coords[1] === 'number' &&
+            Number.isFinite(coords[0]) &&
+            Number.isFinite(coords[1]) &&
+            !(coords[0] === 0 && coords[1] === 0) &&
+            Math.abs(coords[0]) <= 180 &&
+            Math.abs(coords[1]) <= 90;
+
+          if (!hasValidCoords) {
+            // Missing coordinates cannot verify distance inside specified radius -> excluded explicitly
+            missingCoordinatesCount++;
             areaMatched = false;
+          } else {
+            distanceKm = this.calculateDistanceKm(
+              dto.lat!,
+              dto.lng!,
+              coords[1],
+              coords[0],
+            );
+            if (distanceKm > radiusKm) {
+              areaMatched = false;
+            }
           }
         }
 
@@ -1316,39 +1523,44 @@ export class ChecklistsService {
         }
         passedAreaCount++;
 
-        // Filter 2: Required attributes (e.g. shoe size / clothing size)
-        const reqAttrs = item.requiredAttributes || {};
-        const reqSizeRaw =
-          reqAttrs.size ?? reqAttrs.sizeEu ?? reqAttrs.shoeSize ?? null;
+        // Filter 2: Required attributes (per-size matching + capacity check)
+        const gearSizes = this.extractCandidateGearSizeStrings(gear);
         let attrMatched = true;
         let attrMatchScore = 0;
 
-        if (
-          reqSizeRaw !== null &&
-          reqSizeRaw !== undefined &&
-          String(reqSizeRaw).trim() !== ''
-        ) {
-          const requestedSizes = String(reqSizeRaw)
-            .split(/[,;/\s]+/)
-            .map((s) => s.trim().toLowerCase())
-            .filter(Boolean);
-          const gearSizeVal =
-            gear.attributes?.sizeEu ??
-            gear.attributes?.size ??
-            gear.attributes?.shoeSize ??
-            null;
-          const gearSizeStr =
-            gearSizeVal !== null && gearSizeVal !== undefined
-              ? String(gearSizeVal).trim().toLowerCase()
-              : '';
-
-          if (
-            !gearSizeStr ||
-            !requestedSizes.some((rs) => gearSizeStr === rs)
-          ) {
+        if (requiredSizesAll.length > 0) {
+          const matchedAnyReqSize = gearSizes.some((gs) =>
+            requiredSizesAll.includes(gs),
+          );
+          if (!matchedAnyReqSize) {
             attrMatched = false;
           } else {
             attrMatchScore += 10;
+          }
+        }
+
+        if (attrMatched && minRequiredCapacity > 0) {
+          const gearCap = Number(
+            gear.attributes?.capacityPersons ??
+              gear.attributes?.sleepCapacity ??
+              gear.attributes?.capacity ??
+              0,
+          );
+          if (!gearCap || gearCap < minRequiredCapacity) {
+            attrMatched = false;
+          } else {
+            attrMatchScore += 5;
+          }
+        }
+
+        if (attrMatched && minRequiredVolume > 0) {
+          const gearVol = Number(
+            gear.attributes?.volumeLiters ?? gear.attributes?.capacityLiters ?? 0,
+          );
+          if (!gearVol || gearVol < minRequiredVolume) {
+            attrMatched = false;
+          } else {
+            attrMatchScore += 3;
           }
         }
 
@@ -1357,66 +1569,35 @@ export class ChecklistsService {
         }
         passedAttributesCount++;
 
-        // Filter 3: Availability in [startAt, endAt)
-        // Check both GearAvailability records AND active overlapping Bookings
-        const overlappingBlocks = await this.availabilityModel
-          .find({
-            gearId: gear._id,
-            startAt: { $lt: end },
-            endAt: { $gt: start },
-          })
-          .lean();
+        // Filter 3: Unified 9B rental duration limits & sweep-line peak occupancy
+        const durationCheck =
+          this.availabilityService.validateRentalDurationAndNotice(
+            gear,
+            start,
+            rentalDays,
+          );
+        if (!durationCheck.valid) {
+          continue;
+        }
 
-        const activeOverlappingBookings = await this.bookingModel
-          .find({
-            gearId: gear._id,
-            status: {
-              $in: [
-                BookingStatus.APPROVED,
-                BookingStatus.IN_USE,
-                BookingStatus.RETURN_PENDING,
-              ],
-            },
-            startAt: { $lt: end },
-            endAt: { $gt: start },
-          })
-          .lean();
-
-        const blockedBookingIds = new Set(
-          overlappingBlocks
-            .filter((b: any) => b.bookingId)
-            .map((b: any) => String(b.bookingId)),
-        );
-
-        const reservedFromAvailability = overlappingBlocks.reduce(
-          (sum: number, b: any) => sum + (Number(b.reservedQuantity) || 1),
-          0,
-        );
-        const reservedFromUnlinkedBookings = activeOverlappingBookings
-          .filter((bk: any) => !blockedBookingIds.has(String(bk._id)))
-          .reduce((sum: number, bk: any) => sum + (Number(bk.quantity) || 1), 0);
-
-        const totalReserved =
-          reservedFromAvailability + reservedFromUnlinkedBookings;
         const totalQuantity = Math.max(1, Number(gear.totalQuantity) || 1);
-        const availableQuantity = Math.max(0, totalQuantity - totalReserved);
-
+        const availableQuantity = availableByGearId.get(gIdStr) ?? 0;
         if (availableQuantity < 1) {
           continue;
         }
         passedScheduleCount++;
 
-        // Filter 4: Sharing type & Budget filter
+        // Filter 4: Sharing type & Budget cap per listing card
         const gearSharingType: GearListingType =
           gear.sharingType || gear.listingType || GearListingType.RENT;
-        const pricePerDay = Math.max(
-          0,
-          Number(gear.pricePerDay ?? gear.dailyPriceVnd ?? 0),
+        const unitQuote = this.availabilityService.calculateRentalQuote(
+          gear,
+          rentalDays,
+          1,
         );
-        const depositPerUnit = Math.max(
-          0,
-          Number(gear.depositAmount ?? gear.depositAmountVnd ?? 0),
-        );
+        const pricePerDay = unitQuote.pricePerDay;
+        const depositPerUnit = unitQuote.depositPerUnit;
+        const unitRentalFee = unitQuote.totalRentalFee;
 
         if (dto.sharingType) {
           if (
@@ -1435,32 +1616,51 @@ export class ChecklistsService {
           }
         }
 
-        const fulfillableQuantity = Math.min(
-          item.quantityMissing,
-          availableQuantity,
-        );
-        const unitRentalFee = rentalDays * pricePerDay;
-        const estimatedRentalTotal =
-          rentalDays * pricePerDay * fulfillableQuantity;
-        const depositTotal = depositPerUnit * fulfillableQuantity;
-
+        let maxAffordableUnits = availableQuantity;
         if (hasBudgetLimit && budgetVnd !== null) {
           if (budgetVnd === 0) {
-            // Budget 0đ -> only free loan items (pricePerDay === 0 or FREE_LOAN)
-            if (
-              pricePerDay > 0 &&
-              gearSharingType !== GearListingType.FREE_LOAN
-            ) {
+            if (pricePerDay > 0 && gearSharingType !== GearListingType.FREE_LOAN) {
               continue;
             }
-          } else {
-            // At least 1 unit must be affordable within budgetVnd
+          } else if (unitRentalFee > 0) {
             if (unitRentalFee > budgetVnd) {
               continue;
             }
+            maxAffordableUnits = Math.floor(budgetVnd / unitRentalFee);
           }
         }
         passedSharingAndBudgetCount++;
+
+        // Respect size-specific demand cap when listing matches a single size in a multi-size request
+        const matchingSizeDemandQty =
+          requiredSizesAll.length > 0
+            ? sizeDemands
+                .filter((sd) =>
+                  sd.allowedSizes?.some((as) => gearSizes.includes(as)),
+                )
+                .reduce((sum, sd) => sum + sd.qtyNeeded, 0)
+            : item.quantityMissing;
+
+        const fulfillableQuantity = Math.max(
+          0,
+          Math.min(
+            item.quantityMissing,
+            matchingSizeDemandQty > 0 ? matchingSizeDemandQty : item.quantityMissing,
+            availableQuantity,
+            maxAffordableUnits,
+          ),
+        );
+        if (fulfillableQuantity < 1) {
+          continue;
+        }
+
+        const fullQuote = this.availabilityService.calculateRentalQuote(
+          gear,
+          rentalDays,
+          fulfillableQuantity,
+        );
+        const estimatedRentalTotal = fullQuote.totalRentalFee;
+        const depositTotal = fullQuote.depositAmount;
 
         const ownerProfile = profileMap.get(String(gear.ownerId));
         const conditionScore = CONDITION_SCORE[gear.condition] || 2;
@@ -1471,20 +1671,29 @@ export class ChecklistsService {
           `Còn trống ${availableQuantity}/${totalQuantity} ${item.unit} tại ${gear.district}, ${gear.city}`,
           coverageLabel,
         ];
-        if (attrMatchScore > 0 && reqSizeRaw) {
-          reasonParts.push(`Đúng size ${reqSizeRaw}`);
+        if (attrMatchScore > 0 && requiredSizesAll.length > 0 && gearSizes.length > 0) {
+          reasonParts.push(`Khớp size ${gearSizes.map((s) => s.toUpperCase()).join('/')}`);
+        }
+        if (minRequiredCapacity > 0 && gear.attributes?.capacityPersons) {
+          reasonParts.push(`Sức chứa ${gear.attributes.capacityPersons} người`);
         }
         if (pricePerDay === 0 || gearSharingType === GearListingType.FREE_LOAN) {
           reasonParts.push('Cho mượn miễn phí (0 ₫)');
         } else {
           reasonParts.push(
-            `Phí thuê ${estimatedRentalTotal.toLocaleString('vi-VN')} ₫/${rentalDays} ngày`,
+            `Phí ${fulfillableQuantity} ${item.unit}/${rentalDays} ngày: ${estimatedRentalTotal.toLocaleString('vi-VN')} ₫`,
           );
         }
 
+        const bookingUrl = `/gear/${gIdStr}?startAt=${encodeURIComponent(
+          dto.startAt,
+        )}&endAt=${encodeURIComponent(dto.endAt)}&quantity=${fulfillableQuantity}&sharingType=${encodeURIComponent(
+          gearSharingType,
+        )}&expectedPricePerDay=${pricePerDay}&expectedDepositAmount=${depositPerUnit}`;
+
         passingCandidates.push({
-          gearId: String(gear._id),
-          id: String(gear._id),
+          gearId: gIdStr,
+          id: gIdStr,
           title: gear.title,
           categoryCode,
           brand: gear.brand || '',
@@ -1498,6 +1707,7 @@ export class ChecklistsService {
           distanceKm,
           exactDistrictMatched,
           attributes: gear.attributes || {},
+          matchedSizes: gearSizes,
           attributeMatchScore: attrMatchScore,
           totalQuantity,
           availableQuantity,
@@ -1512,7 +1722,7 @@ export class ChecklistsService {
           depositPerUnit,
           depositAmount: depositTotal,
           ratingAvg: Number(gear.ratingAvg) || 5.0,
-          isOwnGear: String(gear.ownerId) === String(currentUserId),
+          isOwnGear: false,
           isDemo: Boolean(gear.isDemo),
           owner: {
             userId: String(gear.ownerId),
@@ -1522,18 +1732,11 @@ export class ChecklistsService {
             trustScore: ownerProfile?.trustScore ?? 4.9,
           },
           recommendationReason: reasonParts.join(' • '),
-          bookingUrl: `/gear/${String(gear._id)}?startAt=${encodeURIComponent(
-            dto.startAt,
-          )}&endAt=${encodeURIComponent(dto.endAt)}&quantity=${fulfillableQuantity}`,
+          bookingUrl,
         });
       }
 
-      // Deterministic ranking:
-      // 1. Attribute match + condition score DESC
-      // 2. Exact district match DESC / distanceKm ASC
-      // 3. Lower daily rental fee (pricePerDay ASC)
-      // 4. Higher ratingAvg DESC
-      // 5. Tie-breaker: gearId ASC
+      // Deterministic, stable ranking across runs
       passingCandidates.sort((a, b) => {
         const scoreA = a.attributeMatchScore + a.conditionScore;
         const scoreB = b.attributeMatchScore + b.conditionScore;
@@ -1558,128 +1761,304 @@ export class ChecklistsService {
         return String(a.gearId).localeCompare(String(b.gearId));
       });
 
-      // Compute how many units of `item.quantityMissing` can be fulfilled across all passing candidates
-      let remainingToFulfill = item.quantityMissing;
-      let minCostForItem = 0;
-      let minDepositForItem = 0;
-
-      const candidatesByCheapest = [...passingCandidates].sort(
-        (a, b) =>
-          a.pricePerDay - b.pricePerDay ||
-          String(a.gearId).localeCompare(String(b.gearId)),
-      );
-
-      for (const cand of candidatesByCheapest) {
-        if (remainingToFulfill <= 0) break;
-        const take = Math.min(remainingToFulfill, cand.availableQuantity);
-        minCostForItem += take * rentalDays * cand.pricePerDay;
-        minDepositForItem += take * cand.depositPerUnit;
-        remainingToFulfill -= take;
-      }
-
-      const totalFulfillableAcrossCandidates =
-        item.quantityMissing - remainingToFulfill;
-      const isItemFullyFulfillable = remainingToFulfill === 0;
-
-      let unmatchedReason: string | null = null;
-      if (passingCandidates.length === 0) {
-        if (totalInCategory === 0) {
-          unmatchedReason =
-            'Hiện chưa có thiết bị thuộc danh mục này đang mở cho thuê trên hệ thống.';
-        } else if (passedAreaCount === 0) {
-          unmatchedReason = `Không có thiết bị cùng loại tại khu vực nhận đồ đã chọn (${rawPickupArea || 'khu vực yêu cầu'}).`;
-        } else if (passedAttributesCount === 0) {
-          const reqSize =
-            item.requiredAttributes?.size ??
-            item.requiredAttributes?.sizeEu ??
-            JSON.stringify(item.requiredAttributes);
-          unmatchedReason = `Không có thiết bị đáp ứng kích cỡ/thuộc tính yêu cầu (Size ${reqSize}).`;
-        } else if (passedScheduleCount === 0) {
-          unmatchedReason =
-            'Các thiết bị cùng loại tại khu vực này đã kín lịch trong khoảng thời gian chọn.';
-        } else if (passedSharingAndBudgetCount === 0) {
-          if (hasBudgetLimit && budgetVnd === 0) {
-            unmatchedReason =
-              'Vượt ngân sách 0đ (không có thiết bị cho mượn miễn phí khả dụng trong khoảng ngày và khu vực này).';
-          } else {
-            unmatchedReason = `Chi phí thuê vượt quá ngân sách dự kiến (${Number(
-              budgetVnd,
-            ).toLocaleString('vi-VN')} ₫).`;
-          }
-        } else {
-          unmatchedReason = 'Không tìm thấy thiết bị phù hợp với bộ lọc hiện tại.';
-        }
-
-        unmatchedItems.push({
-          itemId: item.itemId,
-          categoryCode,
-          name: item.name,
-          quantityRequired: item.quantityRequired,
-          quantityOwned: item.quantityOwned,
-          quantityMissing: item.quantityMissing,
-          unit: item.unit,
-          requiredAttributes: item.requiredAttributes,
-          unmatchedReason,
-        });
-      }
-
-      itemMatches.push({
-        itemId: item.itemId,
+      itemEvaluations.push({
+        item,
         categoryCode,
-        name: item.name,
-        priority: item.priority,
-        unit: item.unit,
-        quantityRequired: item.quantityRequired,
-        quantityNeeded: item.quantityRequired,
-        quantityOwned: item.quantityOwned,
-        quantityMissing: item.quantityMissing,
-        requiredAttributes: item.requiredAttributes,
-        totalFulfillableQuantity: totalFulfillableAcrossCandidates,
-        isFullyFulfillable: isItemFullyFulfillable,
-        coverageSummaryLabel: `Đáp ứng tối đa ${totalFulfillableAcrossCandidates}/${item.quantityMissing} ${item.unit}`,
-        minEstimatedCostForItemVnd: minCostForItem,
-        minDepositForItemVnd: minDepositForItem,
-        unmatchedReason,
-        candidates: passingCandidates,
+        sizeDemands,
+        passingCandidates,
+        totalInCategory,
+        passedAreaCount,
+        missingCoordinatesCount,
+        passedAttributesCount,
+        passedScheduleCount,
+        passedSharingAndBudgetCount,
       });
     }
 
-    // 4. Overall Budget & Fulfillment Evaluation across the entire checklist
-    const canFulfillAllItems =
+    // 5. Global Single-Allocation Solver (1 unit allocated AT MOST ONCE + shared total budget)
+    const remainingUnitPool = new Map<string, number>(availableByGearId);
+    let remainingGlobalBudget =
+      hasBudgetLimit && budgetVnd !== null ? budgetVnd : Number.POSITIVE_INFINITY;
+
+    const allocationPlan: Array<Record<string, any>> = [];
+    const itemAllocationStats = new Map<
+      string,
+      {
+        fulfilledTotal: number;
+        costVnd: number;
+        depositVnd: number;
+        sizeAllocations: Array<{
+          sizeLabel: string | null;
+          qtyNeeded: number;
+          qtyFulfilled: number;
+          unmatchedReason: string | null;
+        }>;
+      }
+    >();
+
+    const PRIORITY_ORDER: Record<string, number> = {
+      ESSENTIAL: 0,
+      CONDITIONAL: 1,
+      OPTIONAL: 2,
+    };
+
+    const sortedEvalIndices = itemEvaluations
+      .map((_, idx) => idx)
+      .sort((aIdx, bIdx) => {
+        const a = itemEvaluations[aIdx];
+        const b = itemEvaluations[bIdx];
+        const pa = PRIORITY_ORDER[a.item.priority] ?? 1;
+        const pb = PRIORITY_ORDER[b.item.priority] ?? 1;
+        if (pa !== pb) return pa - pb;
+        // Fewer candidates (rarer constraints like exact size) allocate first
+        return a.passingCandidates.length - b.passingCandidates.length;
+      });
+
+    for (const idx of sortedEvalIndices) {
+      const ev = itemEvaluations[idx];
+      let itemFulfilled = 0;
+      let itemCostVnd = 0;
+      let itemDepositVnd = 0;
+      const sizeAllocations: Array<{
+        sizeLabel: string | null;
+        qtyNeeded: number;
+        qtyFulfilled: number;
+        unmatchedReason: string | null;
+      }> = [];
+
+      // Allocate tightest size constraints first
+      const sortedSizeDemands = [...ev.sizeDemands].sort(
+        (a, b) => (a.allowedSizes?.length || 99) - (b.allowedSizes?.length || 99),
+      );
+
+      for (const sd of sortedSizeDemands) {
+        let need = sd.qtyNeeded;
+        const eligibleForSize = ev.passingCandidates
+          .filter((cand) => {
+            if (!sd.allowedSizes || sd.allowedSizes.length === 0) return true;
+            const gs: string[] = cand.matchedSizes || [];
+            return gs.some((s) => sd.allowedSizes!.includes(s));
+          })
+          .sort(
+            (a, b) =>
+              a.pricePerDay - b.pricePerDay ||
+              b.attributeMatchScore - a.attributeMatchScore ||
+              String(a.gearId).localeCompare(String(b.gearId)),
+          );
+
+        for (const cand of eligibleForSize) {
+          if (need <= 0) break;
+          const poolLeft = remainingUnitPool.get(cand.gearId) ?? 0;
+          if (poolLeft <= 0) continue;
+
+          const maxBudgetTake =
+            cand.unitRentalFee > 0 && Number.isFinite(remainingGlobalBudget)
+              ? Math.floor(remainingGlobalBudget / cand.unitRentalFee)
+              : need;
+
+          const take = Math.min(need, poolLeft, maxBudgetTake);
+          if (take <= 0) continue;
+
+          remainingUnitPool.set(cand.gearId, poolLeft - take);
+          const allocCost = take * cand.unitRentalFee;
+          const allocDeposit = take * cand.depositPerUnit;
+          if (Number.isFinite(remainingGlobalBudget)) {
+            remainingGlobalBudget = Math.max(
+              0,
+              remainingGlobalBudget - allocCost,
+            );
+          }
+
+          need -= take;
+          itemFulfilled += take;
+          itemCostVnd += allocCost;
+          itemDepositVnd += allocDeposit;
+
+          allocationPlan.push({
+            itemId: ev.item.itemId,
+            categoryCode: ev.categoryCode,
+            itemName: ev.item.name,
+            sizeLabel: sd.sizeLabel,
+            gearId: cand.gearId,
+            title: cand.title,
+            quantityAllocated: take,
+            unit: ev.item.unit,
+            pricePerDay: cand.pricePerDay,
+            rentalDays,
+            totalRentalFee: allocCost,
+            depositAmount: allocDeposit,
+            bookingUrl: `/gear/${cand.gearId}?startAt=${encodeURIComponent(
+              dto.startAt,
+            )}&endAt=${encodeURIComponent(dto.endAt)}&quantity=${take}&sharingType=${encodeURIComponent(
+              cand.sharingType,
+            )}&expectedPricePerDay=${cand.pricePerDay}&expectedDepositAmount=${cand.depositPerUnit}`,
+          });
+        }
+
+        const fulfilledForSize = sd.qtyNeeded - need;
+        sizeAllocations.push({
+          sizeLabel: sd.sizeLabel,
+          qtyNeeded: sd.qtyNeeded,
+          qtyFulfilled: fulfilledForSize,
+          unmatchedReason:
+            need > 0
+              ? sd.sizeLabel
+                ? `Thiếu ${need} ${ev.item.unit} Size ${sd.sizeLabel}`
+                : `Thiếu ${need} ${ev.item.unit}`
+              : null,
+        });
+      }
+
+      itemAllocationStats.set(ev.item.itemId, {
+        fulfilledTotal: itemFulfilled,
+        costVnd: itemCostVnd,
+        depositVnd: itemDepositVnd,
+        sizeAllocations,
+      });
+    }
+
+    // Build final `itemMatches` and `unmatchedItems` preserving deterministic order
+    const itemMatches: Array<Record<string, any>> = [];
+    const unmatchedItems: Array<Record<string, any>> = [];
+
+    for (const ev of itemEvaluations) {
+      const stats = itemAllocationStats.get(ev.item.itemId)!;
+      const totalFulfillableAcrossCandidates = stats.fulfilledTotal;
+      const isItemFullyFulfillable =
+        totalFulfillableAcrossCandidates >= ev.item.quantityMissing;
+
+      let unmatchedReason: string | null = null;
+      if (!isItemFullyFulfillable) {
+        const missingSizeMsgs = stats.sizeAllocations
+          .filter((sa) => sa.unmatchedReason)
+          .map((sa) => sa.unmatchedReason!);
+
+        if (ev.passingCandidates.length === 0) {
+          if (ev.totalInCategory === 0) {
+            unmatchedReason =
+              'Hiện chưa có thiết bị thuộc danh mục này đang mở cho thuê trên hệ thống.';
+          } else if (ev.passedAreaCount === 0) {
+            unmatchedReason =
+              hasGeoFilter && ev.missingCoordinatesCount > 0
+                ? `Không có thiết bị hợp lệ trong bán kính ${radiusKm} km (${ev.missingCoordinatesCount} tin bị loại do thiếu tọa độ hoặc ngoài phạm vi).`
+                : `Không có thiết bị cùng loại tại khu vực nhận đồ đã chọn (${rawPickupArea || 'khu vực yêu cầu'}).`;
+          } else if (ev.passedAttributesCount === 0) {
+            const reqSize =
+              ev.item.requiredAttributes?.size ??
+              ev.item.requiredAttributes?.sizeEu ??
+              ev.item.requiredAttributes?.capacityPersons ??
+              JSON.stringify(ev.item.requiredAttributes);
+            unmatchedReason = `Không có thiết bị đáp ứng kích cỡ/sức chứa yêu cầu (Size ${reqSize}).`;
+          } else if (ev.passedScheduleCount === 0) {
+            unmatchedReason =
+              'Các thiết bị cùng loại tại khu vực này đã kín lịch hoặc không khớp giới hạn ngày thuê.';
+          } else if (ev.passedSharingAndBudgetCount === 0) {
+            if (hasBudgetLimit && budgetVnd === 0) {
+              unmatchedReason =
+                'Vượt ngân sách 0đ (không có thiết bị cho mượn miễn phí khả dụng trong khoảng ngày và khu vực này).';
+            } else {
+              unmatchedReason = `Chi phí thuê vượt quá ngân sách dự kiến (${Number(
+                budgetVnd,
+              ).toLocaleString('vi-VN')} ₫).`;
+            }
+          } else {
+            unmatchedReason =
+              'Không tìm thấy thiết bị phù hợp với bộ lọc hiện tại.';
+          }
+        } else if (missingSizeMsgs.length > 0 && ev.sizeDemands.length > 1) {
+          unmatchedReason = `Chỉ đáp ứng ${totalFulfillableAcrossCandidates}/${ev.item.quantityMissing} ${ev.item.unit}: ${missingSizeMsgs.join(', ')} (các size khác không bù thay thế cho nhau).`;
+        } else {
+          unmatchedReason = hasBudgetLimit
+            ? `Chỉ phân bổ được tối đa ${totalFulfillableAcrossCandidates}/${ev.item.quantityMissing} ${ev.item.unit} trong phần tồn trống và ngân sách còn lại.`
+            : `Tổng số lượng trống trong khu vực chỉ đáp ứng ${totalFulfillableAcrossCandidates}/${ev.item.quantityMissing} ${ev.item.unit}.`;
+        }
+
+        if (ev.passingCandidates.length === 0 || !isItemFullyFulfillable) {
+          unmatchedItems.push({
+            itemId: ev.item.itemId,
+            categoryCode: ev.categoryCode,
+            name: ev.item.name,
+            quantityRequired: ev.item.quantityRequired,
+            quantityOwned: ev.item.quantityOwned,
+            quantityMissing: ev.item.quantityMissing,
+            quantityFulfilled: totalFulfillableAcrossCandidates,
+            unit: ev.item.unit,
+            requiredAttributes: ev.item.requiredAttributes,
+            unmatchedReason,
+          });
+        }
+      }
+
+      const displayCandidates = dto.limitPerItem
+        ? ev.passingCandidates.slice(0, dto.limitPerItem)
+        : ev.passingCandidates;
+
+      itemMatches.push({
+        itemId: ev.item.itemId,
+        categoryCode: ev.categoryCode,
+        name: ev.item.name,
+        priority: ev.item.priority,
+        unit: ev.item.unit,
+        quantityRequired: ev.item.quantityRequired,
+        quantityNeeded: ev.item.quantityRequired,
+        quantityOwned: ev.item.quantityOwned,
+        quantityMissing: ev.item.quantityMissing,
+        requiredAttributes: ev.item.requiredAttributes,
+        sizeAllocations: stats.sizeAllocations,
+        totalFulfillableQuantity: totalFulfillableAcrossCandidates,
+        isFullyFulfillable: isItemFullyFulfillable,
+        coverageSummaryLabel: `Đáp ứng tối đa ${totalFulfillableAcrossCandidates}/${ev.item.quantityMissing} ${ev.item.unit}`,
+        minEstimatedCostForItemVnd: stats.costVnd,
+        minDepositForItemVnd: stats.depositVnd,
+        unmatchedReason,
+        candidates: displayCandidates,
+        totalCandidatesCount: ev.passingCandidates.length,
+      });
+    }
+
+    // 6. Overall Budget & Fulfillment Evaluation strictly derived from concrete `allocationPlan`
+    const hasUnconfirmedItems = unconfirmedOwnedItems.length > 0;
+    const canFulfillAllConfirmed =
       neededRentableItems.length > 0 &&
       itemMatches.every((m) => m.isFullyFulfillable);
-    const minTotalEstimatedCostVnd = itemMatches.reduce(
-      (sum, m) => sum + (Number(m.minEstimatedCostForItemVnd) || 0),
+    const minTotalEstimatedCostVnd = allocationPlan.reduce(
+      (sum, a) => sum + (Number(a.totalRentalFee) || 0),
       0,
     );
-    const minTotalDepositVnd = itemMatches.reduce(
-      (sum, m) => sum + (Number(m.minDepositForItemVnd) || 0),
+    const minTotalDepositVnd = allocationPlan.reduce(
+      (sum, a) => sum + (Number(a.depositAmount) || 0),
       0,
     );
 
     let isWithinTotalBudget = false;
     let budgetStatusLabel = 'Chưa đặt giới hạn ngân sách';
 
-    if (neededRentableItems.length === 0) {
+    if (neededRentableItems.length === 0 && hasUnconfirmedItems) {
+      isWithinTotalBudget = false;
+      budgetStatusLabel =
+        'Chưa xác nhận đủ số lượng đồ đã có để kết luận nhu cầu thuê';
+    } else if (neededRentableItems.length === 0) {
       isWithinTotalBudget = true;
       budgetStatusLabel = 'Đã có đủ thiết bị, không cần thuê thêm';
+    } else if (hasUnconfirmedItems) {
+      isWithinTotalBudget = false;
+      budgetStatusLabel = `Còn ${unconfirmedOwnedItems.length} mục chưa rõ số lượng đã có — chưa thể kết luận đủ cho toàn bộ chuyến đi`;
     } else if (hasBudgetLimit && budgetVnd !== null) {
-      if (canFulfillAllItems && minTotalEstimatedCostVnd <= budgetVnd) {
+      if (canFulfillAllConfirmed && minTotalEstimatedCostVnd <= budgetVnd) {
         isWithinTotalBudget = true;
         budgetStatusLabel = 'Đủ đồ trong ngân sách';
-      } else if (!canFulfillAllItems && minTotalEstimatedCostVnd <= budgetVnd) {
+      } else if (budgetVnd === 0) {
         isWithinTotalBudget = false;
         budgetStatusLabel =
-          'Chưa đủ số lượng thiết bị đáp ứng toàn bộ checklist (dù chi phí phần tìm được nằm trong ngân sách)';
+          'Ngân sách 0đ chỉ hỗ trợ đồ mượn miễn phí — chưa đáp ứng đủ toàn bộ nhu cầu';
       } else {
         isWithinTotalBudget = false;
-        budgetStatusLabel = `Tổng chi phí thuê tối thiểu (${minTotalEstimatedCostVnd.toLocaleString(
-          'vi-VN',
-        )} ₫) vượt ngân sách (${budgetVnd.toLocaleString('vi-VN')} ₫)`;
+        budgetStatusLabel =
+          'Chưa có phương án đáp ứng đủ toàn bộ nhu cầu trong ngân sách';
       }
     } else {
-      isWithinTotalBudget = canFulfillAllItems;
-      budgetStatusLabel = canFulfillAllItems
+      isWithinTotalBudget = canFulfillAllConfirmed;
+      budgetStatusLabel = canFulfillAllConfirmed
         ? 'Đủ thiết bị đáp ứng toàn bộ checklist'
         : 'Đáp ứng một phần số lượng thiết bị cần thuê';
     }
@@ -1696,6 +2075,9 @@ export class ChecklistsService {
       },
       filters: {
         pickupArea: rawPickupArea || null,
+        lat: dto.lat ?? null,
+        lng: dto.lng ?? null,
+        radiusKm: hasGeoFilter ? radiusKm : null,
         budgetVnd,
         hasBudgetLimit,
         sharingType: dto.sharingType || null,
@@ -1705,10 +2087,12 @@ export class ChecklistsService {
         budgetVnd,
         minTotalEstimatedCostVnd,
         minTotalDepositVnd,
-        canFulfillAllItems,
+        canFulfillAllItems: canFulfillAllConfirmed && !hasUnconfirmedItems,
         isWithinTotalBudget,
+        hasUnconfirmedItems,
         statusLabel: budgetStatusLabel,
       },
+      allocationPlan,
       itemMatches,
       unmatchedItems,
       nonRentableItems: nonRentableItems.map((i) => ({
@@ -1725,9 +2109,127 @@ export class ChecklistsService {
         name: i.name,
         quantityRequired: i.quantityRequired,
         quantityOwned: i.quantityOwned,
-        message: `Bạn đã đề cập có sẵn "${i.name}" trong hội thoại. Vui lòng xác nhận số lượng thực tế đang có.`,
+        message: `Bạn đã đề cập có sẵn "${i.name}" trong hội thoại. Vui lòng nhập số lượng thực tế đang có để hệ thống tính phần còn thiếu.`,
       })),
     };
+  }
+
+  private parseItemSizeDemands(item: ChecklistEntry): Array<{
+    sizeLabel: string | null;
+    allowedSizes: string[] | null;
+    qtyNeeded: number;
+  }> {
+    const reqAttrs = item.requiredAttributes || {};
+    const totalMissing = Math.max(1, Number(item.quantityMissing) || 1);
+
+    if (
+      reqAttrs.sizeBreakdown &&
+      typeof reqAttrs.sizeBreakdown === 'object' &&
+      !Array.isArray(reqAttrs.sizeBreakdown)
+    ) {
+      const entries = Object.entries(reqAttrs.sizeBreakdown)
+        .map(([k, v]) => ({
+          sizeLabel: String(k).trim(),
+          qty: Math.max(0, Math.floor(Number(v) || 0)),
+        }))
+        .filter((e) => e.sizeLabel && e.qty > 0);
+
+      if (entries.length > 0) {
+        let budget = totalMissing;
+        const result: Array<{
+          sizeLabel: string | null;
+          allowedSizes: string[] | null;
+          qtyNeeded: number;
+        }> = [];
+        for (const e of entries) {
+          if (budget <= 0) break;
+          const take = Math.min(budget, e.qty);
+          result.push({
+            sizeLabel: e.sizeLabel,
+            allowedSizes: [e.sizeLabel.toLowerCase()],
+            qtyNeeded: take,
+          });
+          budget -= take;
+        }
+        if (budget > 0) {
+          result.push({
+            sizeLabel: null,
+            allowedSizes: null,
+            qtyNeeded: budget,
+          });
+        }
+        return result;
+      }
+    }
+
+    const reqSizeRaw =
+      reqAttrs.size ?? reqAttrs.sizeEu ?? reqAttrs.shoeSize ?? null;
+    if (
+      reqSizeRaw !== null &&
+      reqSizeRaw !== undefined &&
+      String(reqSizeRaw).trim() !== ''
+    ) {
+      const requestedSizes = String(reqSizeRaw)
+        .split(/[,;/\s]+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+      if (requestedSizes.length >= 2 && totalMissing >= requestedSizes.length) {
+        const base = Math.floor(totalMissing / requestedSizes.length);
+        let rem = totalMissing % requestedSizes.length;
+        return requestedSizes.map((sz) => {
+          const take = base + (rem > 0 ? 1 : 0);
+          if (rem > 0) rem--;
+          return {
+            sizeLabel: sz,
+            allowedSizes: [sz.toLowerCase()],
+            qtyNeeded: take,
+          };
+        });
+      }
+
+      if (requestedSizes.length >= 2) {
+        return [
+          {
+            sizeLabel: requestedSizes.join('/'),
+            allowedSizes: requestedSizes.map((s) => s.toLowerCase()),
+            qtyNeeded: totalMissing,
+          },
+        ];
+      }
+
+      if (requestedSizes.length === 1) {
+        return [
+          {
+            sizeLabel: requestedSizes[0],
+            allowedSizes: [requestedSizes[0].toLowerCase()],
+            qtyNeeded: totalMissing,
+          },
+        ];
+      }
+    }
+
+    return [{ sizeLabel: null, allowedSizes: null, qtyNeeded: totalMissing }];
+  }
+
+  private extractCandidateGearSizeStrings(gear: any): string[] {
+    const attrs = gear?.attributes || {};
+    const candidates: unknown[] = [
+      attrs.sizeEu,
+      attrs.size,
+      attrs.shoeSize,
+      ...(Array.isArray(attrs.availableSizes) ? attrs.availableSizes : []),
+    ];
+    const out = new Set<string>();
+    for (const val of candidates) {
+      if (val === null || val === undefined) continue;
+      const str = String(val).trim().toLowerCase();
+      if (!str) continue;
+      for (const part of str.split(/[,;/\s]+/)) {
+        if (part.trim()) out.add(part.trim());
+      }
+    }
+    return Array.from(out);
   }
 
   formatChecklist(checklist: any, plan?: any): Record<string, any> {
@@ -1794,19 +2296,27 @@ export class ChecklistsService {
         unconfirmedCount: items.filter((i: any) => !i.ownedConfirmed).length,
       },
       travelPlan: plan
-        ? {
-            id: String(plan._id),
-            destination: plan.destination,
-            activity: plan.activity,
-            durationDays: plan.durationDays,
-            travelers: plan.travelers,
-            departureDate: plan.departureDate
-              ? new Date(plan.departureDate).toISOString().slice(0, 10)
-              : null,
-            budgetVnd: plan.budgetVnd ?? null,
-            pickupArea: plan.pickupArea ?? null,
-            planVersion: Number(plan.planVersion) || 1,
-          }
+        ? (() => {
+            const norm = normalizeLegacyActivity(
+              plan.activity,
+              (plan as any).environment,
+            );
+            return {
+              id: String(plan._id),
+              destination: plan.destination,
+              activity: norm.activity || plan.activity,
+              environment: norm.environment,
+              isOvernight: (plan as any).isOvernight ?? null,
+              durationDays: plan.durationDays,
+              travelers: plan.travelers,
+              departureDate: plan.departureDate
+                ? new Date(plan.departureDate).toISOString().slice(0, 10)
+                : null,
+              budgetVnd: plan.budgetVnd ?? null,
+              pickupArea: plan.pickupArea ?? null,
+              planVersion: Number(plan.planVersion) || 1,
+            };
+          })()
         : undefined,
       createdAt: checklist.createdAt,
       updatedAt: checklist.updatedAt,

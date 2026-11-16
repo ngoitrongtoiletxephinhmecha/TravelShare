@@ -109,6 +109,12 @@ export interface ChecklistItemMatchDto {
   quantityOwned: number;
   quantityMissing: number;
   requiredAttributes: Record<string, any>;
+  sizeAllocations?: Array<{
+    sizeLabel: string | null;
+    qtyNeeded: number;
+    qtyFulfilled: number;
+    unmatchedReason: string | null;
+  }>;
   totalFulfillableQuantity: number;
   isFullyFulfillable: boolean;
   coverageSummaryLabel: string;
@@ -116,6 +122,7 @@ export interface ChecklistItemMatchDto {
   minDepositForItemVnd: number;
   unmatchedReason: string | null;
   candidates: ChecklistMatchCandidateDto[];
+  totalCandidatesCount?: number;
 }
 
 export interface ChecklistMatchResultDto {
@@ -130,6 +137,9 @@ export interface ChecklistMatchResultDto {
   };
   filters: {
     pickupArea: string | null;
+    lat?: number | null;
+    lng?: number | null;
+    radiusKm?: number | null;
     budgetVnd: number | null;
     hasBudgetLimit: boolean;
     sharingType: string | null;
@@ -141,8 +151,24 @@ export interface ChecklistMatchResultDto {
     minTotalDepositVnd: number;
     canFulfillAllItems: boolean;
     isWithinTotalBudget: boolean;
+    hasUnconfirmedItems?: boolean;
     statusLabel: string;
   };
+  allocationPlan?: Array<{
+    itemId: string;
+    categoryCode: string;
+    itemName: string;
+    sizeLabel: string | null;
+    gearId: string;
+    title: string;
+    quantityAllocated: number;
+    unit: string;
+    pricePerDay: number;
+    rentalDays: number;
+    totalRentalFee: number;
+    depositAmount: number;
+    bookingUrl: string;
+  }>;
   itemMatches: ChecklistItemMatchDto[];
   unmatchedItems: Array<{
     itemId: string;

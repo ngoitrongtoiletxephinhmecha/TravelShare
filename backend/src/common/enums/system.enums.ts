@@ -16,8 +16,54 @@ export enum ActivityType {
   MOTORBIKE_TOUR = 'MOTORBIKE_TOUR',
   BACKPACKING = 'BACKPACKING',
   MOUNTAINEERING = 'MOUNTAINEERING',
-  BEACH_CAMPING = 'BEACH_CAMPING',
+  BEACH = 'BEACH',
+  SIGHTSEEING = 'SIGHTSEEING',
   OTHER = 'OTHER',
+}
+
+export type TripEnvironment = 'COASTAL' | 'MOUNTAIN' | 'FOREST' | 'URBAN';
+
+const OFFICIAL_ACTIVITY_SET = new Set<string>(Object.values(ActivityType));
+
+/**
+ * Normalizes official or legacy (e.g. BEACH_CAMPING) activity values while
+ * preserving coastal context for legacy BEACH_CAMPING records.
+ */
+export function normalizeLegacyActivity(
+  rawActivity: string | null | undefined,
+  rawEnvironment?: string | null,
+): {
+  activity: ActivityType | null;
+  environment: TripEnvironment | null;
+  wasLegacyBeachCamping: boolean;
+} {
+  const normalizedEnv: TripEnvironment | null =
+    rawEnvironment && ['COASTAL', 'MOUNTAIN', 'FOREST', 'URBAN'].includes(String(rawEnvironment).toUpperCase())
+      ? (String(rawEnvironment).toUpperCase() as TripEnvironment)
+      : null;
+
+  if (!rawActivity) {
+    return { activity: null, environment: normalizedEnv, wasLegacyBeachCamping: false };
+  }
+
+  const upper = String(rawActivity).trim().toUpperCase();
+  if (upper === 'BEACH_CAMPING') {
+    return {
+      activity: ActivityType.CAMPING,
+      environment: normalizedEnv || 'COASTAL',
+      wasLegacyBeachCamping: true,
+    };
+  }
+
+  if (OFFICIAL_ACTIVITY_SET.has(upper)) {
+    return {
+      activity: upper as ActivityType,
+      environment: upper === ActivityType.BEACH && !normalizedEnv ? 'COASTAL' : normalizedEnv,
+      wasLegacyBeachCamping: false,
+    };
+  }
+
+  return { activity: null, environment: normalizedEnv, wasLegacyBeachCamping: false };
 }
 
 export enum ExperienceLevel {

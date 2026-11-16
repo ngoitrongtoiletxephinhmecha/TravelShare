@@ -14,6 +14,10 @@ export function createDefaultTripState(): ValidatedTripState {
     destination: null,
     route: null,
     activity: null,
+    environment: null,
+    isOvernight: null,
+    secondaryActivities: [],
+    savedSpots: [],
     departureDate: null,
     endDate: null,
     durationDays: null,
@@ -31,11 +35,25 @@ export function createDefaultTripState(): ValidatedTripState {
 export function normalizeTripState(raw: any): ValidatedTripState {
   const base = createDefaultTripState();
   if (!raw || typeof raw !== 'object') return base;
+  const rawActivity = raw.activity ?? null;
+  const normalizedActivity =
+    rawActivity === 'BEACH_CAMPING' ? 'CAMPING' : rawActivity;
+  const normalizedEnvironment =
+    raw.environment ??
+    (rawActivity === 'BEACH_CAMPING' || rawActivity === 'BEACH'
+      ? 'COASTAL'
+      : null);
   return {
     intent: raw.intent ?? null,
     destination: raw.destination ?? null,
     route: raw.route ?? null,
-    activity: raw.activity ?? null,
+    activity: normalizedActivity,
+    environment: normalizedEnvironment,
+    isOvernight: typeof raw.isOvernight === 'boolean' ? raw.isOvernight : null,
+    secondaryActivities: Array.isArray(raw.secondaryActivities)
+      ? raw.secondaryActivities
+      : [],
+    savedSpots: Array.isArray(raw.savedSpots) ? raw.savedSpots : [],
     departureDate: raw.departureDate ?? null,
     endDate: raw.endDate ?? null,
     durationDays:

@@ -141,6 +141,9 @@ describe('BookingsService & Double-Booking Prevention Suite (Phase 4)', () => {
           g.reservationVersion =
             (g.reservationVersion || 0) + update.$inc.reservationVersion;
         }
+        if (update.$set) {
+          Object.assign(g, update.$set);
+        }
         return { ...g };
       }),
       updateOne: jest.fn(async (filter: any, update: any) => {
@@ -153,6 +156,13 @@ describe('BookingsService & Double-Booking Prevention Suite (Phase 4)', () => {
     };
 
     const mockBookingModel: any = {
+      findOne: jest.fn(async (filter: any) => {
+        return availabilityStore.get(String(filter._id)) || null;
+      }),
+      deleteOne: jest.fn(async (filter: any) => {
+        availabilityStore.delete(String(filter._id));
+        return { deletedCount: 1 };
+      }),
       create: jest.fn(async (payload: any) => {
         const id = new Types.ObjectId();
         const doc = {
@@ -181,6 +191,10 @@ describe('BookingsService & Double-Booking Prevention Suite (Phase 4)', () => {
             return false;
           if (filter._id?.$ne && String(b._id) === String(filter._id.$ne))
             return false;
+          if (filter._id?.$in) {
+            const allowed = filter._id.$in.map((id: any) => String(id));
+            if (!allowed.includes(String(b._id))) return false;
+          }
           if (filter.status?.$in && !filter.status.$in.includes(b.status))
             return false;
           if (
@@ -245,6 +259,13 @@ describe('BookingsService & Double-Booking Prevention Suite (Phase 4)', () => {
           return true;
         });
         return makeChainable(list);
+      }),
+      findOne: jest.fn(async (filter: any) => {
+        return availabilityStore.get(String(filter._id)) || null;
+      }),
+      deleteOne: jest.fn(async (filter: any) => {
+        availabilityStore.delete(String(filter._id));
+        return { deletedCount: 1 };
       }),
       create: jest.fn(async (payload: any) => {
         const item = Array.isArray(payload) ? payload[0] : payload;
@@ -381,6 +402,7 @@ describe('BookingsService & Double-Booking Prevention Suite (Phase 4)', () => {
     availabilityService = new AvailabilityService(
       mockAvailabilityModel,
       mockGearModel,
+      mockBookingModel,
     );
     eventsService = new BookingEventsService();
 
@@ -724,5 +746,262 @@ describe('BookingsService & Double-Booking Prevention Suite (Phase 4)', () => {
       },
     );
     expect(resolved.status).toBe(DisputeStatus.RESOLVED_FOR_OWNER);
+  });
+
+  // =========================================================================
+  // PHASE 9B — PEAK CONCURRENCY, RECONCILIATION, EXPIRY, ROLLBACK & PRIVACY
+  // =========================================================================
+  it('15. Phase 9B: computes sweep-line peak concurrency for multi-unit gear (morning+afternoon vs OWNER_BLOCKED+APPROVED)', async () => {
+    gearsStore.set(gearId, {
+      ...gearsStore.get(gearId),
+      totalQuantity: 2,
+      availabilitySettings: {
+        minRentalDays: 1,
+        maxRentalDays: 14,
+        advanceNoticeHours: 0,
+      },
+    });
+
+    // Morning booking [08:00, 12:00) qty=1 and Afternoon booking [13:00, 17:00) qty=1 on 2026-12-05 ICT
+    const morning = await service.createBooking(renterId1, {
+      gearId,
+      startAt: '2026-12-05T08:00:00+07:00',
+      endAt: '2026-12-05T12:00:00+07:00',
+      quantity: 1,
+    });
+    const afternoon = await service.createBooking(renterId2, {
+      gearId,
+      startAt: '2026-12-05T13:00:00+07:00',
+      endAt: '2026-12-05T17:00:00+07:00',
+      quantity: 1,
+    });
+    await service.approveBooking(morning.id, ownerId, UserRole.USER);
+    await service.approveBooking(afternoon.id, ownerId, UserRole.USER);
+
+    // Whole day [08:00, 18:00) peak = 1 -> 1 unit still available across marketplace map, availability check & booking
+    const fullDayCheck = await availabilityService.getGearAvailability(gearId, {
+      startAt: '2026-12-05T08:00:00+07:00',
+      endAt: '2026-12-05T18:00:00+07:00',
+      quantity: 1,
+    });
+    expect(fullDayCheck.isAvailable).toBe(true);
+    expect(fullDayCheck.availableQuantity).toBe(1);
+
+    const reservedMap = await availabilityService.getOverlappingReservedMap(
+      new Date('2026-12-05T08:00:00+07:00'),
+      new Date('2026-12-05T18:00:00+07:00'),
+    );
+    expect(reservedMap.get(gearId)).toBe(1);
+
+    // Now owner locks 1 unit at [09:00, 11:00) overlapping the morning APPROVED booking -> peak becomes 2, 0 left in morning!
+    await availabilityService.addUnavailablePeriod(ownerId, UserRole.USER, gearId, {
+      startAt: '2026-12-05T09:00:00+07:00',
+      endAt: '2026-12-05T11:00:00+07:00',
+      reservedQuantity: 1,
+      note: 'Bảo trì nội bộ buổi sáng',
+    });
+
+    const morningCheckAfterBlock = await availabilityService.getGearAvailability(
+      gearId,
+      {
+        startAt: '2026-12-05T09:00:00+07:00',
+        endAt: '2026-12-05T11:00:00+07:00',
+        quantity: 1,
+      },
+    );
+    expect(morningCheckAfterBlock.isAvailable).toBe(false);
+    expect(morningCheckAfterBlock.availableQuantity).toBe(0);
+
+    // Attempting to create a third booking overlapping [09:00, 11:00) fails cleanly with 409
+    await expect(
+      service.createBooking(renterId1, {
+        gearId,
+        startAt: '2026-12-05T09:30:00+07:00',
+        endAt: '2026-12-05T10:30:00+07:00',
+        quantity: 1,
+      }),
+    ).rejects.toThrow(ConflictException);
+  });
+
+  it('16. Phase 9B: reconciles stale/missing BOOKED slots, counts each booking only once, and holds inventory while DISPUTED until resolved', async () => {
+    // Active booking in DISPUTED status WITHOUT an availability slot (simulate drift)
+    const disputedId = new Types.ObjectId();
+    bookingsStore.set(String(disputedId), {
+      _id: disputedId,
+      gearId: new Types.ObjectId(gearId),
+      renterId: new Types.ObjectId(renterId1),
+      ownerId: new Types.ObjectId(ownerId),
+      quantity: 1,
+      startAt: new Date('2026-12-10T00:00:00+07:00'),
+      endAt: new Date('2026-12-12T00:00:00+07:00'),
+      status: BookingStatus.DISPUTED,
+      statusHistory: [],
+    });
+
+    // Cancelled booking with leftover stale BOOKED slot (simulate drift)
+    const cancelledId = new Types.ObjectId();
+    bookingsStore.set(String(cancelledId), {
+      _id: cancelledId,
+      gearId: new Types.ObjectId(gearId),
+      renterId: new Types.ObjectId(renterId2),
+      ownerId: new Types.ObjectId(ownerId),
+      quantity: 1,
+      startAt: new Date('2026-12-15T00:00:00+07:00'),
+      endAt: new Date('2026-12-17T00:00:00+07:00'),
+      status: BookingStatus.CANCELLED,
+      statusHistory: [],
+    });
+    const staleSlotId = new Types.ObjectId();
+    availabilityStore.set(String(staleSlotId), {
+      _id: staleSlotId,
+      gearId: new Types.ObjectId(gearId),
+      bookingId: cancelledId,
+      startAt: new Date('2026-12-15T00:00:00+07:00'),
+      endAt: new Date('2026-12-17T00:00:00+07:00'),
+      reservedQuantity: 1,
+      reason: 'BOOKED',
+    });
+
+    // DISPUTED holds inventory -> cannot book Dec 10-12
+    const dispAvail = await availabilityService.getGearAvailability(gearId, {
+      startAt: '2026-12-10',
+      endAt: '2026-12-12',
+      quantity: 1,
+    });
+    expect(dispAvail.isAvailable).toBe(false);
+    expect(dispAvail.availableQuantity).toBe(0);
+
+    // Stale slot on CANCELLED booking does NOT block Dec 15-17; new booking + approve runs reconciliation cleaning up stale slot
+    const okBooking = await service.createBooking(renterId2, {
+      gearId,
+      startAt: '2026-12-15',
+      endAt: '2026-12-17',
+      quantity: 1,
+    });
+    const approvedOk = await service.approveBooking(
+      okBooking.id,
+      ownerId,
+      UserRole.USER,
+    );
+    expect(approvedOk.status).toBe(BookingStatus.APPROVED);
+    // Stale slot removed & disputed slot backfilled cleanly
+    expect(availabilityStore.has(String(staleSlotId))).toBe(false);
+    const hasDisputedSlot = Array.from(availabilityStore.values()).some(
+      (s) => String(s.bookingId) === String(disputedId) && s.reason === 'BOOKED',
+    );
+    expect(hasDisputedSlot).toBe(true);
+  });
+
+  it('17. Phase 9B: rejects expired booking directly during approval and leaves zero APPROVED bookings when slot write fails', async () => {
+    const expiredBooking = await service.createBooking(renterId1, {
+      gearId,
+      startAt: '2026-12-20T00:00:00.000Z',
+      endAt: '2026-12-22T00:00:00.000Z',
+    });
+    bookingsStore.get(expiredBooking.id).expiresAt = new Date(Date.now() - 10_000);
+
+    await expect(
+      service.approveBooking(expiredBooking.id, ownerId, UserRole.USER),
+    ).rejects.toThrow(BadRequestException);
+    expect(bookingsStore.get(expiredBooking.id).status).toBe(
+      BookingStatus.EXPIRED,
+    );
+
+    // Fault simulation during recordBookedSlot -> no dangling APPROVED booking!
+    const goodBooking = await service.createBooking(renterId2, {
+      gearId,
+      startAt: '2026-12-20T00:00:00.000Z',
+      endAt: '2026-12-22T00:00:00.000Z',
+    });
+    const spy = jest
+      .spyOn(availabilityService, 'recordBookedSlot')
+      .mockRejectedValueOnce(new Error('Simulated DB availability write failure'));
+
+    await expect(
+      service.approveBooking(goodBooking.id, ownerId, UserRole.USER),
+    ).rejects.toThrow('Simulated DB availability write failure');
+    spy.mockRestore();
+
+    expect(bookingsStore.get(goodBooking.id).status).toBe(BookingStatus.PENDING);
+  });
+
+  it('18. Phase 9B: blocks past intervals, detects stale matching snapshot changes, races owner-block vs approve, and protects private/internal notes', async () => {
+    // 1. Rejects past interval
+    await expect(
+      service.createBooking(renterId1, {
+        gearId,
+        startAt: '2025-01-01',
+        endAt: '2025-01-03',
+      }),
+    ).rejects.toThrow(BadRequestException);
+
+    // 2. Detects stale pricing from matching snapshot
+    await expect(
+      service.createBooking(renterId1, {
+        gearId,
+        startAt: '2026-12-24',
+        endAt: '2026-12-26',
+        expectedPricePerDay: 50000, // gear is actually 100000
+      }),
+    ).rejects.toThrow(ConflictException);
+
+    // 3. Concurrent owner block vs booking approval on last unit -> only ONE succeeds
+    const b = await service.createBooking(renterId1, {
+      gearId,
+      startAt: '2026-12-24',
+      endAt: '2026-12-26',
+    });
+    const raceResults = await Promise.allSettled([
+      availabilityService.addUnavailablePeriod(ownerId, UserRole.USER, gearId, {
+        startAt: '2026-12-24',
+        endAt: '2026-12-26',
+        reservedQuantity: 1,
+        note: 'Ghi chú nội bộ chỉ chủ đồ thấy',
+      }),
+      service.approveBooking(b.id, ownerId, UserRole.USER, {
+        note: 'Phản hồi gửi người thuê',
+        internalNote: 'Ghi chú nội bộ riêng của chủ đồ',
+      }),
+    ]);
+    const fulfilledCount = raceResults.filter((r) => r.status === 'fulfilled').length;
+    expect(fulfilledCount).toBe(1);
+
+    // 4. Public availability sanitizes note & bookingId, while owner sees them
+    const publicCal = await availabilityService.getGearAvailability(gearId);
+    expect(publicCal.periods.length).toBe(1);
+    expect(publicCal.periods[0].note).toBeUndefined();
+    expect(publicCal.periods[0].bookingId).toBeUndefined();
+
+    const ownerCal = await availabilityService.getGearAvailability(
+      gearId,
+      undefined,
+      ownerId,
+      UserRole.USER,
+    );
+    expect(ownerCal.periods[0].note).toBeTruthy();
+
+    // 5. Booking internal note hidden from renter, visible to owner/admin
+    const b2 = await service.createBooking(renterId2, {
+      gearId,
+      startAt: '2026-12-28',
+      endAt: '2026-12-30',
+    });
+    await service.approveBooking(b2.id, ownerId, UserRole.USER, {
+      note: 'Hẹn bạn 18h',
+      internalNote: 'Khách cần mang CCCD bản gốc đối chiếu',
+    });
+
+    const renterView = await service.getBookingById(
+      b2.id,
+      renterId2,
+      UserRole.USER,
+    );
+    expect(renterView.ownerResponseNote).toBe('Hẹn bạn 18h');
+    expect(renterView.ownerInternalNote).toBeUndefined();
+
+    const ownerView = await service.getBookingById(b2.id, ownerId, UserRole.USER);
+    expect(ownerView.ownerInternalNote).toBe(
+      'Khách cần mang CCCD bản gốc đối chiếu',
+    );
   });
 });

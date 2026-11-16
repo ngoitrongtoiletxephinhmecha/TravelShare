@@ -4,6 +4,7 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  Optional,
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -30,6 +31,8 @@ import {
   ExperienceLevel,
   UserRole,
 } from '../../common/enums/system.enums';
+import { AuthEventsService } from './auth-events.service';
+import { GoogleOAuthUserProfile } from './strategies/google.strategy';
 
 @Injectable()
 export class AuthService {
@@ -38,6 +41,7 @@ export class AuthService {
     @InjectModel(Profile.name) private profileModel: Model<ProfileDocument>,
     private jwtService: JwtService,
     private configService: ConfigService,
+    @Optional() private readonly authEventsService?: AuthEventsService,
   ) {}
 
   async register(dto: RegisterDto, userAgent?: string) {
@@ -110,6 +114,12 @@ export class AuthService {
     if (user.status !== AccountStatus.ACTIVE) {
       throw new ForbiddenException(
         `Tài khoản hiện đang ở trạng thái ${user.status}. Vui lòng liên hệ quản trị viên.`,
+      );
+    }
+
+    if (!user.passwordHash) {
+      throw new UnauthorizedException(
+        'Tài khoản này sử dụng đăng nhập Google và chưa thiết lập mật khẩu. Vui lòng tiếp tục với Google.',
       );
     }
 
@@ -208,12 +218,21 @@ export class AuthService {
       user.refreshSessions = [];
     }
     await user.save();
+    this.authEventsService?.emitSessionRevoked({
+      userId: String(userId),
+      sessionId,
+      reason: sessionId ? 'LOGOUT' : 'REVOKE_ALL',
+    });
     return { revoked: true };
   }
 
   async revokeAllSessions(userId: string) {
     await this.userModel.findByIdAndUpdate(userId, {
       $set: { refreshSessions: [] },
+    });
+    this.authEventsService?.emitSessionRevoked({
+      userId: String(userId),
+      reason: 'REVOKE_ALL',
     });
     return { message: 'Đã thu hồi toàn bộ phiên đăng nhập trên mọi thiết bị' };
   }
@@ -280,6 +299,10 @@ export class AuthService {
     user.resetPasswordExpiresAt = undefined;
     user.refreshSessions = [];
     await user.save();
+    this.authEventsService?.emitSessionRevoked({
+      userId: String(user._id),
+      reason: 'PASSWORD_CHANGED',
+    });
 
     return {
       message: 'Đặt lại mật khẩu thành công. Vui lòng đăng nhập lại.',
@@ -294,6 +317,12 @@ export class AuthService {
       throw new NotFoundException('Không tìm thấy tài khoản');
     }
 
+    if (!user.passwordHash) {
+      throw new BadRequestException(
+        'Tài khoản đăng nhập bằng Google hiện chưa có mật khẩu. Vui lòng dùng tính năng Quên mật khẩu để đặt mật khẩu mới.',
+      );
+    }
+
     const isMatch = await bcrypt.compare(dto.currentPassword, user.passwordHash);
     if (!isMatch) {
       throw new BadRequestException('Mật khẩu hiện tại không chính xác');
@@ -302,10 +331,135 @@ export class AuthService {
     user.passwordHash = await bcrypt.hash(dto.newPassword, 12);
     user.refreshSessions = [];
     await user.save();
+    this.authEventsService?.emitSessionRevoked({
+      userId: String(user._id),
+      reason: 'PASSWORD_CHANGED',
+    });
 
     return {
       message: 'Đổi mật khẩu thành công. Các phiên đăng nhập cũ đã được thu hồi.',
     };
+  }
+
+  async loginWithGoogle(
+    googleProfile: GoogleOAuthUserProfile,
+    userAgent?: string,
+  ) {
+    if (!googleProfile?.googleId || !googleProfile?.email) {
+      throw new UnauthorizedException(
+        'Không nhận được thông tin tài khoản hợp lệ từ Google',
+      );
+    }
+
+    const normalizedEmail = googleProfile.email.toLowerCase().trim();
+    let user = await this.userModel
+      .findOne({
+        $or: [
+          { googleId: googleProfile.googleId },
+          { email: normalizedEmail },
+        ],
+      })
+      .select('+refreshSessions');
+
+    if (user) {
+      if (user.status !== AccountStatus.ACTIVE) {
+        throw new ForbiddenException(
+          `Tài khoản hiện đang ở trạng thái ${user.status}. Vui lòng liên hệ quản trị viên.`,
+        );
+      }
+
+      if (!user.googleId) {
+        if (!googleProfile.emailVerified) {
+          throw new UnauthorizedException(
+            'Email Google chưa được xác minh để liên kết với tài khoản hiện có',
+          );
+        }
+        user.googleId = googleProfile.googleId;
+      }
+      if (googleProfile.emailVerified) {
+        user.emailVerified = true;
+      }
+      user.lastLoginAt = new Date();
+
+      let profile = await this.profileModel.findOne({ userId: user._id });
+      if (!profile) {
+        profile = await this.createDefaultGoogleProfile(
+          user._id as Types.ObjectId,
+          normalizedEmail,
+          googleProfile.fullName,
+          googleProfile.avatarUrl,
+        );
+      } else if (!profile.avatarUrl && googleProfile.avatarUrl) {
+        profile.avatarUrl = googleProfile.avatarUrl;
+        await profile.save();
+      }
+
+      const tokens = await this.issueSessionTokens(user, userAgent);
+      return {
+        user: this.sanitizeUserResponse(user, profile),
+        ...tokens,
+      };
+    }
+
+    const newUser = await this.userModel.create({
+      email: normalizedEmail,
+      googleId: googleProfile.googleId,
+      role: UserRole.USER,
+      status: AccountStatus.ACTIVE,
+      emailVerified: Boolean(googleProfile.emailVerified),
+      refreshSessions: [],
+      lastLoginAt: new Date(),
+    });
+
+    const newProfile = await this.createDefaultGoogleProfile(
+      newUser._id as Types.ObjectId,
+      normalizedEmail,
+      googleProfile.fullName,
+      googleProfile.avatarUrl,
+    );
+
+    const tokens = await this.issueSessionTokens(newUser, userAgent);
+    return {
+      user: this.sanitizeUserResponse(newUser, newProfile),
+      ...tokens,
+    };
+  }
+
+  private async createDefaultGoogleProfile(
+    userId: Types.ObjectId,
+    email: string,
+    fullName: string,
+    avatarUrl?: string,
+  ) {
+    const rawBase = email
+      .split('@')[0]
+      .replace(/[^a-zA-Z0-9_]/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 22)
+      .toLowerCase();
+    const baseUsername = rawBase.length >= 3 ? rawBase : `user_${rawBase || 'ts'}`;
+
+    let finalUsername = baseUsername;
+    const existingUsername = await this.profileModel.findOne({
+      username: finalUsername,
+    });
+    if (existingUsername) {
+      finalUsername = `${baseUsername.slice(0, 18)}_${crypto.randomBytes(2).toString('hex')}`;
+    }
+
+    const displayName = (fullName || email.split('@')[0] || 'Thành viên').trim();
+    return this.profileModel.create({
+      userId,
+      username: finalUsername,
+      fullName: displayName,
+      avatarUrl:
+        avatarUrl ||
+        `https://ui-avatars.com/api/?name=${encodeURIComponent(displayName)}&background=166534&color=fff`,
+      bio: 'Thành viên cộng đồng du lịch & chia sẻ đồ phượt TravelShare.',
+      city: 'Hà Nội, Việt Nam',
+      experienceLevel: ExperienceLevel.BEGINNER,
+      favoriteActivities: ['TREKKING', 'CAMPING'],
+    });
   }
 
   getGoogleOAuthStatus() {

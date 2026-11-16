@@ -4,6 +4,8 @@ import { GoogleGenerativeAI, SchemaType, Schema } from '@google/generative-ai';
 import {
   ActivityType,
   ExperienceLevel,
+  normalizeLegacyActivity,
+  TripEnvironment,
 } from '../../common/enums/system.enums';
 import {
   AiIntentType,
@@ -29,6 +31,10 @@ export type TurnActionType =
   | 'GENERAL_QA'
   | 'ITINERARY_ADVICE'
   | 'DESTINATION_QA'
+  | 'SUGGEST_SPOTS'
+  | 'SAVED_SPOTS_READ'
+  | 'MISSING_ITEMS_READ'
+  | 'FIND_RENTAL_GEAR'
   | 'CHECKLIST_ITEM_READ'
   | 'CHECKLIST_VIEW'
   | 'CHECKLIST_CREATE'
@@ -68,6 +74,11 @@ export interface ExtractedTripPatch {
   readChecklistCodes?: string[];
   requestChecklistPrint?: boolean;
   requestChecklistCreate?: boolean;
+  requestMissingItemsList?: boolean;
+  requestRentalGearMatch?: boolean;
+  requestSavedSpotsRead?: boolean;
+  requestSpotSuggestions?: boolean;
+  spotSuggestionsAnswer?: string | null;
   preliminaryGearSuggestion?: string | null;
   isHowToQuestion?: boolean;
   isUnrecognizedFallback?: boolean;
@@ -133,12 +144,22 @@ const KNOWN_DESTINATIONS: Array<{ pattern: RegExp; canonical: string }> = [
   { pattern: /nhìu\s*cồ\s*san/i, canonical: 'Nhìu Cồ San' },
   { pattern: /hồ\s*đồng\s*đò/i, canonical: 'Hồ Đồng Đò' },
   { pattern: /hàm\s*lợn/i, canonical: 'Núi Hàm Lợn' },
-  { pattern: /ba\s*vì/i, canonical: 'Vườn Quốc gia Ba Vì' },
-  { pattern: /cúc\s*phương/i, canonical: 'Vườn Quốc gia Cúc Phương' },
+  { pattern: /(?:vườn\s*quốc\s*gia|vqg)?\s*ba\s*vì/i, canonical: 'Vườn Quốc gia Ba Vì' },
+  {
+    pattern: /(?:vườn\s*quốc\s*gia|vqg)?\s*cúc\s*phương/i,
+    canonical: 'Vườn Quốc gia Cúc Phương',
+  },
   { pattern: /tà\s*năng\s*[-–]?\s*phan\s*dũng/i, canonical: 'Tà Năng - Phan Dũng' },
   { pattern: /tà\s*năng/i, canonical: 'Tà Năng - Phan Dũng' },
   { pattern: /bidoup/i, canonical: 'Bidoup - Núi Bà' },
+  {
+    pattern: /(?:vườn\s*quốc\s*gia|vqg)\s*cát\s*bà/i,
+    canonical: 'Vườn Quốc gia Cát Bà',
+  },
+  { pattern: /vịnh\s*lan\s*hạ/i, canonical: 'Vịnh Lan Hạ' },
   { pattern: /cát\s*bà/i, canonical: 'Cát Bà' },
+  { pattern: /phú\s*quốc/i, canonical: 'Phú Quốc' },
+  { pattern: /cô\s*tô/i, canonical: 'Cô Tô' },
   { pattern: /mẫu\s*sơn/i, canonical: 'Mẫu Sơn' },
   { pattern: /sapa|sa\s*pa/i, canonical: 'Sa Pa' },
   { pattern: /mộc\s*châu/i, canonical: 'Mộc Châu' },
@@ -218,10 +239,58 @@ const OWNED_GEAR_LEXICON: Array<{
       unit: 'tấm',
     },
     {
-      pattern: /máy\s*ảnh|\bcamera\b|\bgopro\b/i,
+      pattern: /máy\s*ảnh|\bcamera\b|\bgopro\b|action\s*cam/i,
       code: 'CAMERA',
       labelVi: 'máy ảnh',
       unit: 'chiếc',
+    },
+    {
+      pattern: /đồ\s*bơi|quần\s*bơi|áo\s*bơi|\bswimwear\b/i,
+      code: 'SWIMWEAR',
+      labelVi: 'đồ bơi',
+      unit: 'bộ',
+    },
+    {
+      pattern: /khăn\s*tắm/i,
+      code: 'BEACH_TOWEL',
+      labelVi: 'khăn tắm',
+      unit: 'chiếc',
+    },
+    {
+      pattern: /dép\s*đi\s*biển|dép\s*lê/i,
+      code: 'BEACH_SANDALS',
+      labelVi: 'dép đi biển',
+      unit: 'đôi',
+    },
+    {
+      pattern: /kem\s*chống\s*nắng|kính\s*râm/i,
+      code: 'SUN_PROTECTION',
+      labelVi: 'chống nắng & kính râm',
+      unit: 'bộ',
+    },
+    {
+      pattern: /túi\s*khô|túi\s*chống\s*nước|\bdry\s*bag\b/i,
+      code: 'DRY_BAG',
+      labelVi: 'túi chống nước',
+      unit: 'chiếc',
+    },
+    {
+      pattern: /mũ\s*bảo\s*hiểm|\bhelmet\b/i,
+      code: 'HELMET',
+      labelVi: 'mũ bảo hiểm',
+      unit: 'chiếc',
+    },
+    {
+      pattern: /sạc\s*dự\s*phòng|pin\s*dự\s*phòng/i,
+      code: 'POWER_BANK',
+      labelVi: 'sạc dự phòng',
+      unit: 'chiếc',
+    },
+    {
+      pattern: /giày\s*đi\s*bộ|giày\s*thể\s*thao/i,
+      code: 'WALKING_SHOES',
+      labelVi: 'giày đi bộ',
+      unit: 'đôi',
     },
   ];
 
@@ -233,6 +302,10 @@ export const TRIP_EXTRACTION_RESPONSE_SCHEMA: Schema = {
       enum: [
         'SMALL_TALK',
         'DESTINATION_QA',
+        'SUGGEST_SPOTS',
+        'SAVED_SPOTS_READ',
+        'MISSING_ITEMS_READ',
+        'FIND_RENTAL_GEAR',
         'GENERAL_QA',
         'ITINERARY_ADVICE',
         'TRIP_PLANNING',
@@ -271,9 +344,24 @@ export const TRIP_EXTRACTION_RESPONSE_SCHEMA: Schema = {
         'MOTORBIKE_TOUR',
         'BACKPACKING',
         'MOUNTAINEERING',
-        'BEACH_CAMPING',
+        'BEACH',
+        'SIGHTSEEING',
         'OTHER',
       ],
+      nullable: true,
+    },
+    environment: {
+      type: SchemaType.STRING,
+      enum: ['COASTAL', 'MOUNTAIN', 'FOREST', 'URBAN'],
+      nullable: true,
+    },
+    isOvernight: {
+      type: SchemaType.BOOLEAN,
+      nullable: true,
+    },
+    secondaryActivities: {
+      type: SchemaType.ARRAY,
+      items: { type: SchemaType.STRING },
       nullable: true,
     },
     departureDate: {
@@ -381,7 +469,7 @@ export class TripRequirementParser {
   ): Promise<ExtractedTripPatch> {
     const startTime = Date.now();
     const modelName =
-      this.configService.get<string>('gemini.model') || 'gemini-4-hydrogen';
+      this.configService.get<string>('gemini.model') || 'gemini-3.5-flash';
 
     // Handle explicit error simulation for testing resilience
     if (options?.simulateError === 'NOT_FOUND') {
@@ -458,6 +546,9 @@ export class TripRequirementParser {
         hasGeneralQa ||
         hasItineraryAdvice ||
         hasDestinationQa ||
+        turnActions.includes('SUGGEST_SPOTS') ||
+        turnActions.includes('SAVED_SPOTS_READ') ||
+        turnActions.includes('MISSING_ITEMS_READ') ||
         turnActions.includes('CHECKLIST_ITEM_READ') ||
         turnActions.includes('CHECKLIST_VIEW'));
 
@@ -480,12 +571,14 @@ export class TripRequirementParser {
       };
     }
 
-    // 2) Pure checklist read/view ("Còn thiếu mấy balo?", "Cho tôi xem checklist") without QA
+    // 2) Pure checklist/saved-state read/view ("Còn thiếu mấy balo?", "Nhóm còn thiếu những đồ gì?", "Mình đã chọn những điểm nào?", "Cho tôi xem checklist") without QA
     if (
       !this.customGenerator &&
       !hasDestinationQa &&
       !hasGeneralQa &&
       !hasItineraryAdvice &&
+      !turnActions.includes('SUGGEST_SPOTS') &&
+      !turnActions.includes('FIND_RENTAL_GEAR') &&
       hasReadOnlyActionsOnly
     ) {
       const latencyMs = Date.now() - startTime;
@@ -547,6 +640,10 @@ export class TripRequirementParser {
       hasDestinationQa ||
       hasGeneralQa ||
       hasItineraryAdvice ||
+      turnActions.includes('SUGGEST_SPOTS') ||
+      turnActions.includes('SAVED_SPOTS_READ') ||
+      turnActions.includes('MISSING_ITEMS_READ') ||
+      turnActions.includes('FIND_RENTAL_GEAR') ||
       turnActions.includes('CHECKLIST_ITEM_READ') ||
       turnActions.includes('CHECKLIST_VIEW') ||
       hasSmallTalkOnly;
@@ -614,12 +711,18 @@ export class TripRequirementParser {
         const isGeminiPureQaOrChat =
           (geminiPatch.turnIntent === 'SMALL_TALK' ||
             geminiPatch.turnIntent === 'GENERAL_QA' ||
-            geminiPatch.turnIntent === 'DESTINATION_QA') &&
+            geminiPatch.turnIntent === 'DESTINATION_QA' ||
+            geminiPatch.turnIntent === 'SUGGEST_SPOTS' ||
+            geminiPatch.turnIntent === 'SAVED_SPOTS_READ' ||
+            geminiPatch.turnIntent === 'MISSING_ITEMS_READ') &&
           !hasPlanningOrMutationText;
 
         if (isGeminiPureQaOrChat) {
           delete SafeGeminiUpdated.destination;
           delete SafeGeminiUpdated.activity;
+          delete SafeGeminiUpdated.environment;
+          delete SafeGeminiUpdated.isOvernight;
+          delete SafeGeminiUpdated.secondaryActivities;
           delete SafeGeminiUpdated.durationDays;
           delete SafeGeminiUpdated.travelers;
           delete SafeGeminiUpdated.intent;
@@ -664,6 +767,29 @@ export class TripRequirementParser {
         }
         if (geminiPatch.turnIntent === 'ITINERARY_ADVICE') {
           mergedActions.add('ITINERARY_ADVICE');
+        }
+        if (geminiPatch.turnIntent === 'DESTINATION_QA') {
+          mergedActions.add('DESTINATION_QA');
+        }
+        if (
+          geminiPatch.turnIntent === 'SUGGEST_SPOTS' ||
+          geminiPatch.turnIntent === 'SAVED_SPOTS_READ' ||
+          geminiPatch.turnIntent === 'MISSING_ITEMS_READ' ||
+          geminiPatch.turnIntent === 'FIND_RENTAL_GEAR'
+        ) {
+          mergedActions.add(geminiPatch.turnIntent as TurnActionType);
+        }
+        if (geminiPatch.turnIntent === 'SUGGEST_SPOTS') {
+          finalPatch.requestSpotSuggestions = true;
+        }
+        if (geminiPatch.turnIntent === 'SAVED_SPOTS_READ') {
+          finalPatch.requestSavedSpotsRead = true;
+        }
+        if (geminiPatch.turnIntent === 'MISSING_ITEMS_READ') {
+          finalPatch.requestMissingItemsList = true;
+        }
+        if (geminiPatch.turnIntent === 'FIND_RENTAL_GEAR') {
+          finalPatch.requestRentalGearMatch = true;
         }
         if (
           Object.keys(mergedUpdated).some(
@@ -711,9 +837,12 @@ export class TripRequirementParser {
       }
     }
 
-    // 3. Answer DESTINATION_QA if requested in the latest message
+    // 3. Answer DESTINATION_QA / SUGGEST_SPOTS if requested in the latest message
     let qaSource: 'GEMINI' | 'LOCAL_KNOWLEDGE' | 'NONE' = 'NONE';
-    if (hasDestinationQa) {
+    const effectiveHasDestinationQa =
+      hasDestinationQa ||
+      (finalPatch.turnActions || []).includes('DESTINATION_QA');
+    if (effectiveHasDestinationQa || finalPatch.requestSpotSuggestions) {
       const qaSubject =
         finalPatch.qaSubjectDestination ||
         finalPatch.updatedFields.destination ||
@@ -727,6 +856,7 @@ export class TripRequirementParser {
         currentTripState,
         modelName,
         geminiQaAnswer,
+        Boolean(finalPatch.requestSpotSuggestions),
       );
       finalPatch.qaSubjectDestination = qaSubject;
       finalPatch.destinationAnswer = qaResult.answer;
@@ -746,7 +876,11 @@ export class TripRequirementParser {
       (finalPatch.readChecklistCodes?.length || 0) > 0 ||
       Boolean(finalPatch.requestChecklistPrint) ||
       Boolean(finalPatch.requestChecklistCreate) ||
-      hasDestinationQa ||
+      Boolean(finalPatch.requestMissingItemsList) ||
+      Boolean(finalPatch.requestRentalGearMatch) ||
+      Boolean(finalPatch.requestSavedSpotsRead) ||
+      Boolean(finalPatch.requestSpotSuggestions) ||
+      effectiveHasDestinationQa ||
       hasSmallTalkOnly;
 
     if (
@@ -885,13 +1019,16 @@ export class TripRequirementParser {
       'Bạn là Trợ lý AI TravelShare tại Việt Nam (chatbot du lịch & chuẩn bị đồ dã ngoại).',
       'Hãy phân tích Ý ĐỊNH CỦA TIN NHẮN MỚI NHẤT dựa trên lịch sử hội thoại gần đây, tripState hiện tại và danh sách checklist đang lưu.',
       'QUY TẮC BẮT BUỘC:',
-      '1. Nếu người dùng chỉ chào hỏi, cảm ơn (`SMALL_TALK`) hoặc hỏi kiến thức chung (`GENERAL_QA` như so sánh balo trekking vs balo thường, cách thao tác...) hoặc hỏi thông tin địa điểm (`DESTINATION_QA`): trả `turnIntent` tương ứng, viết `qaAnswer` tự nhiên bằng tiếng Việt, và ĐỂ `destination/activity/durationDays/travelers` là `null` nếu họ chưa chốt kế hoạch đi.',
-      '2. KHÔNG tự gán `activity = "TREKKING"` khi người dùng chỉ nói "Tôi muốn đi Ba Vì" hoặc "mình muốn đi ở đó" mà chưa nêu loại hoạt động.',
-      '3. Với câu hỏi địa điểm hoặc lịch trình: KHÔNG bịa giá vé hôm nay, giờ mở cửa hôm nay hay thời tiết thời gian thực nếu không có nguồn cập nhật.',
-      '4. Nếu tin nhắn nhắc "ở đó", tham chiếu tới địa điểm vừa nhắc trong hội thoại (`' +
+      '1. Nếu người dùng chỉ chào hỏi, cảm ơn (`SMALL_TALK`), hỏi kiến thức chung (`GENERAL_QA`), hỏi thông tin địa điểm (`DESTINATION_QA`), gợi ý điểm chơi (`SUGGEST_SPOTS`), hỏi lại điểm đã chọn (`SAVED_SPOTS_READ`) hoặc hỏi danh sách đồ đang thiếu (`MISSING_ITEMS_READ`): trả `turnIntent` tương ứng, viết `qaAnswer` tự nhiên bằng tiếng Việt nếu phù hợp, và ĐỂ `destination/activity/durationDays/travelers` là `null` nếu họ chưa chốt thay đổi kế hoạch.',
+      '2. KHÔNG tự gán `activity = "TREKKING"` khi người dùng chỉ nói "Tôi muốn đi Ba Vì", "Tôi muốn đi Cát Bà" hoặc "mình muốn đi ở đó" mà chưa nêu loại hoạt động.',
+      '3. Phân biệt hoạt động chính xác theo enum chính thức (`TREKKING`, `CAMPING`, `MOTORBIKE_TOUR`, `BACKPACKING`, `MOUNTAINEERING`, `BEACH`, `SIGHTSEEING`, `OTHER`): đi biển ban ngày -> `BEACH` + `environment = "COASTAL"`; cắm trại qua đêm ở bãi biển -> `CAMPING` + `environment = "COASTAL"` + `isOvernight = true`; tham quan/ngắm cảnh -> `SIGHTSEEING`.',
+      '4. Giữ nguyên tên đầy đủ của địa điểm khi người dùng chỉ định cụ thể (ví dụ "Đổi địa điểm thành Vườn Quốc gia Cát Bà đi" -> `destination = "Vườn Quốc gia Cát Bà"`, KHÔNG rút gọn thành "Cát Bà").',
+      '5. Với câu hỏi địa điểm hoặc lịch trình: KHÔNG bịa giá vé hôm nay, giờ mở cửa hôm nay hay thời tiết thời gian thực nếu không có nguồn cập nhật.',
+      '6. Nếu tin nhắn nhắc "ở đó", tham chiếu tới địa điểm vừa nhắc trong hội thoại (`' +
       (lastMentionedDestination || currentTripState.destination || 'chưa có') +
       '`).',
-      '5. Nếu yêu cầu xóa trường đã nhập, đưa tên trường vào `clearedFields`.',
+      '7. Nếu người dùng yêu cầu tìm thuê đồ còn thiếu, đặt `turnIntent = "FIND_RENTAL_GEAR"` và `wantsToRent = true`.',
+      '8. Nếu yêu cầu xóa trường đã nhập, đưa tên trường vào `clearedFields`.',
       historyLines ? `Lịch sử gần đây:\n${historyLines}` : 'Chưa có lịch sử trước đó.',
       `tripState hiện tại: ${JSON.stringify(currentTripState)}`,
       existingChecklistItems.length > 0
@@ -1065,10 +1202,16 @@ export class TripRequirementParser {
       'GENERAL_QA',
       'ITINERARY_ADVICE',
       'DESTINATION_QA',
+      'SUGGEST_SPOTS',
+      'SAVED_SPOTS_READ',
+      'MISSING_ITEMS_READ',
+      'FIND_RENTAL_GEAR',
       'CHECKLIST_ITEM_READ',
+      'CHECKLIST_READ',
       'CHECKLIST_VIEW',
       'CHECKLIST_CREATE',
       'TRIP_UPDATE',
+      'TRIP_PLANNING',
       'CHECKLIST_MUTATION',
       'MIXED',
     ];
@@ -1083,7 +1226,12 @@ export class TripRequirementParser {
           `Giá trị turnIntent không hợp lệ: ${String(parsed.turnIntent)}`,
         );
       }
-      turnIntent = parsed.turnIntent;
+      turnIntent =
+        parsed.turnIntent === 'TRIP_PLANNING'
+          ? 'TRIP_UPDATE'
+          : parsed.turnIntent === 'CHECKLIST_READ'
+            ? 'CHECKLIST_ITEM_READ'
+            : parsed.turnIntent;
     }
 
     let qaAnswer: string | null = null;
@@ -1135,14 +1283,51 @@ export class TripRequirementParser {
     }
 
     if (parsed.activity !== undefined && parsed.activity !== null) {
-      const validActivities = Object.values(ActivityType) as string[];
-      if (!validActivities.includes(parsed.activity)) {
+      const normalizedAct = normalizeLegacyActivity(
+        String(parsed.activity),
+        parsed.environment,
+      );
+      if (!normalizedAct.activity) {
         throw new AiProviderException(
           'INVALID_SCHEMA',
           `Giá trị activity không hợp lệ: ${String(parsed.activity)}`,
         );
       }
-      updatedFields.activity = parsed.activity as ActivityType;
+      updatedFields.activity = normalizedAct.activity;
+      if (normalizedAct.environment) {
+        updatedFields.environment = normalizedAct.environment;
+      }
+    }
+
+    if (parsed.environment !== undefined && parsed.environment !== null) {
+      const validEnvs: TripEnvironment[] = ['COASTAL', 'MOUNTAIN', 'FOREST', 'URBAN'];
+      const envUpper = String(parsed.environment).trim().toUpperCase() as TripEnvironment;
+      if (!validEnvs.includes(envUpper)) {
+        throw new AiProviderException(
+          'INVALID_SCHEMA',
+          `Giá trị environment không hợp lệ: ${String(parsed.environment)}`,
+        );
+      }
+      updatedFields.environment = envUpper;
+    }
+
+    if (parsed.isOvernight !== undefined && parsed.isOvernight !== null) {
+      if (typeof parsed.isOvernight !== 'boolean') {
+        throw new AiProviderException(
+          'INVALID_SCHEMA',
+          'Trường isOvernight phải là boolean.',
+        );
+      }
+      updatedFields.isOvernight = parsed.isOvernight;
+    }
+
+    if (Array.isArray(parsed.secondaryActivities)) {
+      const normalizedSec = parsed.secondaryActivities
+        .map((a: any) => normalizeLegacyActivity(String(a)).activity)
+        .filter((a: ActivityType | null): a is ActivityType => Boolean(a));
+      if (normalizedSec.length > 0) {
+        updatedFields.secondaryActivities = Array.from(new Set(normalizedSec));
+      }
     }
 
     if (parsed.durationDays !== undefined && parsed.durationDays !== null) {
@@ -1271,7 +1456,9 @@ export class TripRequirementParser {
     'Sa Pa':
       '**Sa Pa** (Lào Cai) nổi tiếng với khí hậu vùng cao mát lạnh, ruộng bậc thang Mường Hoa, đỉnh Fansipan và các cung trekking bản Cát Cát – Tả Van – Lao Chải.',
     'Cát Bà':
-      '**Cát Bà** (Hải Phòng) kết hợp trekking rừng quốc gia Kim Giao – đỉnh Ngự Lâm với biển đảo và vịnh Lan Hạ, phù hợp dã ngoại & cắm trại biển.',
+      '**Cát Bà** (Hải Phòng) nổi tiếng với hệ sinh thái biển đảo vịnh Lan Hạ cùng rừng quốc gia nguyên sinh, phù hợp cả đi biển thư giãn, tham quan lẫn cắm trại ven biển hoặc trekking rừng Kim Giao – đỉnh Ngự Lâm.',
+    'Vườn Quốc gia Cát Bà':
+      '**Vườn Quốc gia Cát Bà** (Hải Phòng) là khu dự trữ sinh quyển thế giới nổi bật với tuyến trekking rừng Kim Giao – đỉnh Ngự Lâm, động Trung Trang và hệ động thực vật rừng trên núi đá vôi đặc trưng.',
     'Tam Đảo':
       '**Tam Đảo** (Vĩnh Phúc) cách Hà Nội ~80km, khí hậu mát quanh năm, nổi bật với rừng rậm quốc gia, tháp truyền hình và các cung trek ngắn.',
     'Đà Lạt':
@@ -1280,6 +1467,27 @@ export class TripRequirementParser {
       '**Tà Năng - Phan Dũng** là một trong những cung trekking qua rừng thông – đồi cỏ đẹp nhất Việt Nam, nối từ Lâm Đồng xuống Bình Thuận, đòi hỏi chuẩn bị tốt về giày bám, nước uống và dẫn đường.',
     'Cúc Phương':
       '**Vườn Quốc gia Cúc Phương** (Ninh Bình) là rừng nguyên sinh cổ thụ lâu đời nhất Việt Nam, nổi bật với động Người Xưa, cây chò chỉ ngàn năm và mùa bướm thường rơi vào khoảng tháng 4–5.',
+  };
+
+  private static readonly SPOT_SUGGESTIONS_VI: Record<string, string[]> = {
+    'Cát Bà': [
+      'Bãi tắm Cát Cò 1 – 2 – 3 & Bãi Tùng Thu (tắm biển, chèo kayak, ngắm hoàng hôn)',
+      'Vịnh Lan Hạ & Đảo Khỉ (tham quan vịnh, chèo SUP/kayak giữa núi đá vôi)',
+      'Vườn Quốc gia Cát Bà – Đỉnh Ngự Lâm (đi bộ rừng Kim Giao ngắm toàn cảnh đảo)',
+      'Làng chài cổ Cái Bèo & Pháo đài Thần Công (ngắm biển từ trên cao)',
+      'Động Trung Trang & Hang Quân Y (tham quan hang động tự nhiên)',
+    ],
+    'Vườn Quốc gia Cát Bà': [
+      'Rừng Kim Giao – Đỉnh Ngự Lâm (tuyến đi bộ ngắm cảnh đẹp nhất trong Vườn Quốc gia)',
+      'Động Trung Trang & Hang Quân Y (tham quan hệ thống hang đá vôi tự nhiên)',
+      'Ao Ếch & Làng Việt Hải (tuyến đi xuyên rừng kết hợp tham quan làng cổ)',
+    ],
+    'Vườn Quốc gia Ba Vì': [
+      'Đồi thông cốt 400m (dã ngoại, cắm trại nhẹ, chụp ảnh rừng thông)',
+      'Nhà thờ cổ Ba Vì (kiến trúc đá phủ rêu nổi tiếng ở cốt 800m)',
+      'Đỉnh Vua & Đền Thượng (săn mây và ngắm cảnh từ cốt 1100m)',
+      'Nhà kính Xương Rồng (check-in gần cổng vườn)',
+    ],
   };
 
   private extractConversationContext(
@@ -1371,7 +1579,7 @@ export class TripRequirementParser {
 
   private textMentionsExplicitActivity(rawText: string): boolean {
     const lower = (rawText || '').toLowerCase();
-    return /(?:cắm\s*trại\s*biển|\bbeach\s*camping\b|\btrekking\b|\btrek\b|đi\s*bộ\s*đường\s*dài|leo\s*núi|\bcamping\b|cắm\s*trại|dã\s*ngoại|phượt\s*xe\s*máy|chạy\s*xe\s*máy|\bmotorbike\b|\bbackpacking\b|đi\s*phượt|tham\s*quan|du\s*lịch\s*nghỉ\s*dưỡng)/i.test(
+    return /(?:cắm\s*trại\s*biển|\bbeach\s*camping\b|đi\s*biển|tắm\s*biển|bãi\s*biển|\bbeach\b|tham\s*quan|ngắm\s*cảnh|\bsightseeing\b|\btrekking\b|\btrek\b|đi\s*bộ\s*đường\s*dài|leo\s*núi|\bmountaineering\b|\bcamping\b|cắm\s*trại|dã\s*ngoại|phượt\s*xe\s*máy|chạy\s*xe\s*máy|đi\s*xe\s*máy|\bmotorbike\b|\bbackpacking\b|đi\s*bụi|đi\s*phượt|chèo\s*(?:sup|kayak)|hoạt\s*động\s*khác)/i.test(
       lower,
     );
   }
@@ -1541,6 +1749,7 @@ export class TripRequirementParser {
     currentTripState: ValidatedTripState,
     modelName: string,
     precomputedGeminiAnswer?: string | null,
+    isSpotSuggestionRequest = false,
   ): Promise<{
     answer: string;
     qaSource: 'GEMINI' | 'LOCAL_KNOWLEDGE';
@@ -1554,8 +1763,9 @@ export class TripRequirementParser {
 
     if (!subjectDestination) {
       return {
-        answer:
-          'Mình chưa thấy điểm đến nào được nhắc tới trong cuộc hội thoại gần đây. Bạn muốn mình giới thiệu địa điểm nào?',
+        answer: isSpotSuggestionRequest
+          ? 'Bạn muốn mình gợi ý các điểm đến ở khu vực nào (ví dụ: Cát Bà, Ba Vì, Sa Pa...)? Những gợi ý này chỉ để tham khảo và sẽ chưa tự lưu vào kế hoạch cho tới khi bạn chọn.'
+          : 'Mình chưa thấy điểm đến nào được nhắc tới trong cuộc hội thoại gần đây. Bạn muốn mình giới thiệu địa điểm nào?',
         qaSource: 'LOCAL_KNOWLEDGE',
         needsLiveDisclaimer: false,
         abortedOnTimeout: false,
@@ -1563,8 +1773,11 @@ export class TripRequirementParser {
     }
 
     if (precomputedGeminiAnswer && !this.customQaGenerator) {
+      const answer = isSpotSuggestionRequest
+        ? `${precomputedGeminiAnswer}\n\nℹ️ *Lưu ý:* Các địa điểm trên chỉ là gợi ý tham khảo và **chưa được tự động lưu** vào kế hoạch. Nếu bạn muốn chọn điểm nào làm điểm đến tiếp theo, hãy nhắn rõ nhé.`
+        : precomputedGeminiAnswer;
       return {
-        answer: precomputedGeminiAnswer,
+        answer,
         qaSource: 'GEMINI',
         needsLiveDisclaimer: asksRealtime,
         abortedOnTimeout: false,
@@ -1607,6 +1820,7 @@ export class TripRequirementParser {
           qaQuestion,
           asksRealtime,
           `Không thể kết nối Gemini (${classified.code}) nên dùng thông tin tham khảo tĩnh`,
+          isSpotSuggestionRequest,
         );
         return {
           answer: guide,
@@ -1622,6 +1836,8 @@ export class TripRequirementParser {
         subjectDestination,
         qaQuestion,
         asksRealtime,
+        undefined,
+        isSpotSuggestionRequest,
       ),
       qaSource: 'LOCAL_KNOWLEDGE',
       needsLiveDisclaimer: asksRealtime,
@@ -1634,7 +1850,33 @@ export class TripRequirementParser {
     qaQuestion: string,
     asksRealtime: boolean,
     fallbackPrefix?: string,
+    isSpotSuggestionRequest = false,
   ): string {
+    const spots = TripRequirementParser.SPOT_SUGGESTIONS_VI[destination];
+    if (isSpotSuggestionRequest) {
+      const parts: string[] = [];
+      if (spots && spots.length > 0) {
+        parts.push(
+          `Một số địa điểm tham khảo nổi bật tại **${destination}**:\n${spots
+            .map((s, idx) => `${idx + 1}. ${s}`)
+            .join('\n')}`,
+        );
+      } else {
+        const base = TripRequirementParser.DESTINATION_GUIDE_VI[destination];
+        parts.push(
+          base ||
+          `Hiện hệ thống chưa lưu sẵn danh sách điểm tham quan chi tiết tại **${destination}**.`,
+        );
+      }
+      parts.push(
+        'ℹ️ *Lưu ý:* Đây là gợi ý tham khảo nên **chưa được tự động lưu** vào kế hoạch chuyến đi. Nếu bạn muốn đổi điểm đến hoặc chốt nơi sẽ đi, hãy nhắn lại để mình cập nhật nhé.',
+      );
+      if (fallbackPrefix) {
+        parts.push(`*Ghi chú kết nối:* ${fallbackPrefix}.`);
+      }
+      return parts.join('\n\n');
+    }
+
     const baseInfo = TripRequirementParser.DESTINATION_GUIDE_VI[destination];
     const parts: string[] = [];
 
@@ -1692,6 +1934,10 @@ export class TripRequirementParser {
     readChecklistCodes: string[];
     requestChecklistPrint: boolean;
     requestChecklistCreate: boolean;
+    requestMissingItemsList: boolean;
+    requestRentalGearMatch: boolean;
+    requestSavedSpotsRead: boolean;
+    requestSpotSuggestions: boolean;
     turnActions: TurnActionType[];
   } {
     const normalizedText = (rawText || '').trim();
@@ -1703,6 +1949,10 @@ export class TripRequirementParser {
         readChecklistCodes: [],
         requestChecklistPrint: false,
         requestChecklistCreate: false,
+        requestMissingItemsList: false,
+        requestRentalGearMatch: false,
+        requestSavedSpotsRead: false,
+        requestSpotSuggestions: false,
         turnActions: [],
       };
     }
@@ -1724,6 +1974,10 @@ export class TripRequirementParser {
     const readChecklistCodesSet = new Set<string>();
     let requestChecklistPrint = false;
     let requestChecklistCreate = false;
+    let requestMissingItemsList = false;
+    let requestRentalGearMatch = false;
+    let requestSavedSpotsRead = false;
+    let requestSpotSuggestions = false;
     let sawSmallTalk = false;
     let sawGeneralQa = false;
     let sawItineraryAdvice = false;
@@ -1750,6 +2004,57 @@ export class TripRequirementParser {
         continue;
       }
 
+      // 0b. FIND_RENTAL_GEAR ("Tìm thuê đồ đi biển còn thiếu", "Tìm thuê giúp các món còn thiếu")
+      const isFindRentalGearClause =
+        /(?:tìm\s*(?:thuê|mượn)|kiếm\s*đồ\s*thuê|gợi\s*ý\s*(?:đồ\s*)?thuê|match\s*đồ).*?(?:còn\s*thiếu|đang\s*thiếu|thiếu|trong\s*checklist|cần\s*thuê)|^(?:tìm\s*thuê|thuê\s*giúp|tìm\s*đồ\s*thuê)\b/i.test(
+          lowerClause,
+        );
+      if (isFindRentalGearClause) {
+        requestRentalGearMatch = true;
+        const hasExtraRentalParams =
+          /(?:khu\s*vực|nhận\s*đồ|quận|ngân\s*sách|\d+\s*(?:k|tr|triệu|nghìn|ngàn)|\d{1,2}[/-]\d{1,2}|20\d{2}[/-]\d{1,2}[/-]\d{1,2})/i.test(
+            lowerClause,
+          );
+        if (hasExtraRentalParams) {
+          planningClauses.push(clause);
+        }
+        continue;
+      }
+
+      // 0c. SAVED_SPOTS_READ ("Các địa điểm ở Cát Bà mà mình dự định sẽ đi là gì?", "Mình đã chọn những điểm nào?")
+      const isSavedSpotsReadClause =
+        /(?:địa\s*điểm|điểm(?:\s+đến)?|chỗ|nơi).*?(?:mình|nhóm|đoàn|tôi|ta)?\s*(?:dự\s*định|sẽ\s*đi|đã\s*chọn|đã\s*lưu|đang\s*chốt).*?(?:là\s*gì|nào|chưa|\?$)|(?:mình|nhóm|tôi)\s+đã\s+chọn\s+(?:những\s+)?(?:điểm|địa\s*điểm)\s+nào/i.test(
+          lowerClause,
+        );
+      if (isSavedSpotsReadClause) {
+        requestSavedSpotsRead = true;
+        const namedDest = findDestinationInText(clause);
+        if (namedDest) {
+          qaSubjectDestination = namedDest;
+        }
+        continue;
+      }
+
+      // 0d. SUGGEST_SPOTS ("Gợi ý các địa điểm ở Cát Bà", "Ở Cát Bà có những điểm nào đẹp?")
+      const isSuggestSpotsClause =
+        /(?:gợi\s*ý|đề\s*xuất|có\s+những)\s+(?:các\s+)?(?:địa\s*điểm|điểm\s*(?:tham\s*quan|vui\s*chơi|đẹp|check-?in|du\s*lịch)|chỗ\s*(?:đi|chơi))(?:\s+(?:ở|tại|quanh)\s+[^,.;?!\n]+)?/i.test(
+          lowerClause,
+        );
+      if (isSuggestSpotsClause) {
+        requestSpotSuggestions = true;
+        qaClauses.push(clause);
+        const namedDest = findDestinationInText(clause);
+        if (namedDest) {
+          qaSubjectDestination = namedDest;
+        } else if (!qaSubjectDestination) {
+          qaSubjectDestination =
+            convContext?.lastMentionedDestination ||
+            currentTripState.destination ||
+            null;
+        }
+        continue;
+      }
+
       // 1. Explicit CHECKLIST_VIEW ("xem checklist", "in checklist", "cho xem toàn bộ danh sách")
       const isChecklistView =
         /(xem|in|hiển\s*thị|cho\s*(?:mình\s*|tôi\s*)?xem|liệt\s*kê)\s+(?:toàn\s*bộ\s+|lại\s+)?(?:checklist|danh\s*sách(?:\s*đồ)?)/i.test(
@@ -1770,8 +2075,20 @@ export class TripRequirementParser {
         continue;
       }
 
-      // 2. Explicit CHECKLIST_ITEM_READ ("Còn thiếu mấy lều?", "Thiếu bao nhiêu ghế xếp?", "Hiện đã có mấy lều?")
+      // 2. Explicit CHECKLIST_ITEM_READ / MISSING_ITEMS_READ
       const mentionedItems = this.findLexiconItemsInSegment(clause);
+      const isGeneralMissingRead =
+        mentionedItems.length === 0 &&
+        /(?:(?:nhóm|mình|đoàn|chúng\s*tôi|chúng\s*mình|checklist)\s+)?(?:hiện\s+)?(?:còn\s+)?thiếu\s+(?:những\s+)?(?:đồ|món|gì|thiết\s*bị|vật\s*dụng)(?:\s+nào|\s+gì|\s+vậy|\s+ạ|\s+nhỉ)?|(?:những|các)\s+(?:đồ|món|thiết\s*bị)\s+(?:nào\s+)?(?:đang\s+|còn\s+)?thiếu/i.test(
+          lowerClause,
+        ) &&
+        !/(?:thuê|mượn)/i.test(lowerClause);
+
+      if (isGeneralMissingRead) {
+        requestMissingItemsList = true;
+        continue;
+      }
+
       const hasQuestionQtyCue =
         /(?:mấy|bao\s*nhiêu|bnh|còn\s*bao|đủ\s*chưa)/i.test(lowerClause);
       const hasDigitOrNumWordForGear =
@@ -1817,9 +2134,9 @@ export class TripRequirementParser {
         continue;
       }
 
-      // 2c. GENERAL_QA (how-to questions, gear comparison, conceptual questions)
+      // 2c. GENERAL_QA (how-to questions, gear selection/experience, conceptual comparisons)
       const isHowToQuestion =
-        /(?:cách|làm\s*sao|hướng\s*dẫn)\s+(?:để\s+)?(?:thêm|bớt|sửa|xóa|tạo|cập\s*nhật|thuê|đặt|dùng|chuẩn\s*bị)/i.test(
+        /(?:(?:kinh\s*nghiệm|bí\s*quyết|mẹo|lưu\s*ý|cách|làm\s*sao|hướng\s*dẫn)\s+(?:để\s+)?(?:chọn|thêm|bớt|sửa|xóa|tạo|cập\s*nhật|thuê|đặt|dùng|chuẩn\s*bị|chèo|lái|leo|đi|bảo\s*quản)|(?:nên\s+chọn|nên\s+dùng|nên\s+mang)\s+[^?]{2,50}\??$)/i.test(
           lowerClause,
         );
       const isConceptualComparisonQa =
@@ -1828,7 +2145,8 @@ export class TripRequirementParser {
         );
       if (
         (isHowToQuestion || isConceptualComparisonQa) &&
-        !hasActiveTripDeclaration
+        !hasActiveTripDeclaration &&
+        !hasChecklistOpVerb
       ) {
         sawGeneralQa = true;
         continue;
@@ -1871,6 +2189,10 @@ export class TripRequirementParser {
       qaClauses.length === 0 &&
       !requestChecklistPrint &&
       !requestChecklistCreate &&
+      !requestMissingItemsList &&
+      !requestRentalGearMatch &&
+      !requestSavedSpotsRead &&
+      !requestSpotSuggestions &&
       readChecklistCodesSet.size === 0 &&
       !sawGeneralQa &&
       !sawItineraryAdvice
@@ -1879,7 +2201,13 @@ export class TripRequirementParser {
     }
     if (sawGeneralQa) turnActions.push('GENERAL_QA');
     if (sawItineraryAdvice) turnActions.push('ITINERARY_ADVICE');
-    if (qaClauses.length > 0) turnActions.push('DESTINATION_QA');
+    if (requestSpotSuggestions) turnActions.push('SUGGEST_SPOTS');
+    if (requestSavedSpotsRead) turnActions.push('SAVED_SPOTS_READ');
+    if (requestMissingItemsList) turnActions.push('MISSING_ITEMS_READ');
+    if (requestRentalGearMatch) turnActions.push('FIND_RENTAL_GEAR');
+    if (qaClauses.length > 0 && !requestSpotSuggestions) {
+      turnActions.push('DESTINATION_QA');
+    }
     if (readChecklistCodesSet.size > 0) turnActions.push('CHECKLIST_ITEM_READ');
     if (requestChecklistPrint) turnActions.push('CHECKLIST_VIEW');
     if (requestChecklistCreate) turnActions.push('CHECKLIST_CREATE');
@@ -1891,6 +2219,10 @@ export class TripRequirementParser {
       readChecklistCodes: Array.from(readChecklistCodesSet),
       requestChecklistPrint,
       requestChecklistCreate,
+      requestMissingItemsList,
+      requestRentalGearMatch,
+      requestSavedSpotsRead,
+      requestSpotSuggestions,
       turnActions,
     };
   }
@@ -1935,6 +2267,10 @@ export class TripRequirementParser {
         readChecklistCodes: analyzed.readChecklistCodes,
         requestChecklistPrint: analyzed.requestChecklistPrint,
         requestChecklistCreate: analyzed.requestChecklistCreate,
+        requestMissingItemsList: analyzed.requestMissingItemsList,
+        requestRentalGearMatch: analyzed.requestRentalGearMatch,
+        requestSavedSpotsRead: analyzed.requestSavedSpotsRead,
+        requestSpotSuggestions: analyzed.requestSpotSuggestions,
         ambiguousDateNote: null,
       };
     }
@@ -1973,26 +2309,122 @@ export class TripRequirementParser {
       ownedGearMode = 'CLEAR';
     }
 
-    // 2. Detect Activity (explicit only — never default to TREKKING)
-    if (/cắm\s*trại\s*biển|\bbeach\s*camping\b/i.test(lower)) {
-      updatedFields.activity = ActivityType.BEACH_CAMPING;
-    } else if (/\btrekking\b|\btrek\b|đi\s*bộ\s*đường\s*dài|leo\s*núi/i.test(lower)) {
-      updatedFields.activity = ActivityType.TREKKING;
-    } else if (/\bcamping\b|cắm\s*trại|dã\s*ngoại/i.test(lower)) {
+    // 2. Detect Activity, Coastal/Mountain Environment, Overnight & Secondary Activity (explicit only — never default to TREKKING)
+    // Strip gear-noun modifiers (e.g. "ghế cắm trại", "gậy trekking") so owning gear never misclassifies the trip's main activity.
+    const activityText = lower.replace(
+      /(?:ghế|bàn|bếp|đèn|lều|túi\s*ngủ|thảm|bạt|gậy|giày|balo|túi|dép|kính|áo|mũ|váy)\s+(?:cắm\s*trại|camping|trekking|leo\s*núi|đi\s*biển|dã\s*ngoại|phượt)/gi,
+      ' ',
+    );
+
+    const hasCoastalCue =
+      /(?:bãi\s*biển|ở\s*biển|ven\s*biển|ngoài\s*đảo|\bbeach\b|vịnh\s*lan\s*hạ|cô\s*tô|phú\s*quốc|cát\s*bà(?!.*vườn\s*quốc\s*gia))/i.test(
+        activityText,
+      ) && !/vườn\s*quốc\s*gia/i.test(activityText);
+
+    if (
+      /(?:cắm\s*trại|ngủ\s*lều|\bcamping\b).*?(?:bãi\s*biển|ở\s*biển|ven\s*biển|biển)|(?:bãi\s*biển|ở\s*biển).*?(?:cắm\s*trại|ngủ\s*lều|\bcamping\b)|\bbeach\s*camping\b/i.test(
+        activityText,
+      )
+    ) {
       updatedFields.activity = ActivityType.CAMPING;
-    } else if (/phượt\s*xe\s*máy|chạy\s*xe\s*máy|\bmotorbike\b/i.test(lower)) {
+      updatedFields.environment = 'COASTAL';
+    } else if (
+      /leo\s*núi\s*(?:kỹ\s*thuật|đỉnh\s*cao|mạo\s*hiểm|bằng\s*dây)|\bmountaineering\b/i.test(
+        activityText,
+      )
+    ) {
+      updatedFields.activity = ActivityType.MOUNTAINEERING;
+      updatedFields.environment = 'MOUNTAIN';
+    } else if (
+      /\btrekking\b|\btrek\b|đi\s*bộ\s*(?:đường\s*dài|xuyên\s*rừng|rừng)|leo\s*núi/i.test(
+        activityText,
+      )
+    ) {
+      updatedFields.activity = ActivityType.TREKKING;
+    } else if (/\bcamping\b|cắm\s*trại|dã\s*ngoại|ngủ\s*lều/i.test(activityText)) {
+      updatedFields.activity = ActivityType.CAMPING;
+      if (hasCoastalCue) {
+        updatedFields.environment = 'COASTAL';
+      }
+    } else if (
+      /phượt\s*xe\s*máy|chạy\s*xe\s*máy|đi\s*xe\s*máy|tour\s*xe\s*máy|\bmotorbike\b/i.test(
+        activityText,
+      )
+    ) {
       updatedFields.activity = ActivityType.MOTORBIKE_TOUR;
-    } else if (/\bbackpacking\b|đi\s*phượt/i.test(lower)) {
+    } else if (
+      /\bbackpacking\b|du\s*lịch\s*bụi|đi\s*bụi|tự\s*túc\s*nhiều\s*chặng|đi\s*phượt/i.test(
+        activityText,
+      )
+    ) {
       updatedFields.activity = ActivityType.BACKPACKING;
-    } else if (/tham\s*quan|du\s*lịch\s*nghỉ\s*dưỡng|nghỉ\s*ngơi/i.test(lower)) {
+    } else if (
+      /đi\s*biển|tắm\s*biển|nghỉ\s*biển|ra\s*biển|du\s*lịch\s*biển|\bbeach\b/i.test(
+        activityText,
+      )
+    ) {
+      updatedFields.activity = ActivityType.BEACH;
+      updatedFields.environment = 'COASTAL';
+    } else if (
+      /tham\s*quan|ngắm\s*cảnh|check[-\s]?in|khám\s*phá\s*(?:các\s*)?địa\s*điểm|\bsightseeing\b|du\s*lịch\s*nghỉ\s*dưỡng|nghỉ\s*ngơi/i.test(
+        activityText,
+      )
+    ) {
+      updatedFields.activity = ActivityType.SIGHTSEEING;
+    } else if (
+      /hoạt\s*động\s*khác|chèo\s*(?:sup|kayak|thuyền)|câu\s*cá|team\s*building/i.test(
+        activityText,
+      )
+    ) {
       updatedFields.activity = ActivityType.OTHER;
     }
 
-    // 3. Detect Destination (including coreference "ở đó" / "ở đấy" / "nơi đó")
-    for (const item of KNOWN_DESTINATIONS) {
-      if (item.pattern.test(text)) {
-        updatedFields.destination = item.canonical;
-        break;
+    if (
+      /qua\s*đêm|ngủ\s*lại|ngủ\s*lều|cắm\s*lều\s*đêm|\d+\s*n\s*\d+\s*đ|\b\d+\s*đêm\b|\bovernight\b/i.test(
+        lower,
+      )
+    ) {
+      updatedFields.isOvernight = true;
+    } else if (/đi\s*về\s*trong\s*ngày|ban\s*ngày/i.test(lower)) {
+      updatedFields.isOvernight = false;
+    }
+
+    // 3. Detect Destination (explicit change preserves full specific name like "Vườn Quốc gia Cát Bà"; then KNOWN_DESTINATIONS; then coreference "ở đó")
+    const explicitDestChangeMatch = text.match(
+      /(?:đổi|thay|chuyển|cập\s*nhật|sửa)\s+(?:địa\s*điểm|điểm\s*đến|nơi\s*đi)\s*(?:thành|sang|về|là)\s+([^,.;?!\n]{2,70})/i,
+    );
+    if (explicitDestChangeMatch?.[1]) {
+      const candidateRaw = explicitDestChangeMatch[1]
+        .replace(/\s+(?:đi|nhé|nha|ạ|giúp\s+mình|giúp\s+tôi|luôn)$/i, '')
+        .trim();
+      if (candidateRaw.length >= 2) {
+        let resolvedExplicit = candidateRaw;
+        for (const item of KNOWN_DESTINATIONS) {
+          const match = candidateRaw.match(item.pattern);
+          if (match) {
+            // Only replace with canonical when canonical is at least as specific as what the user typed
+            if (item.canonical.length >= candidateRaw.length - 2) {
+              resolvedExplicit = item.canonical;
+            }
+            break;
+          }
+        }
+        updatedFields.destination = resolvedExplicit;
+      }
+    }
+
+    // Strip pickup-area phrases ("nhận đồ tại Hải Phòng", "khu vực nhận đồ Cầu Giấy") before destination extraction
+    const textForDestination = text.replace(
+      /(?:khu\s*vực\s*(?:nhận|lấy)\s*(?:đồ|thiết\s*bị)?|nhận\s+đồ|lấy\s+đồ|thuê\s+đồ)\s*(?:ở|tại|là|:)?\s*[A-ZÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴÈÉẸẺẼÊỀẾỆỂỄÌÍỊỈĨÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠÙÚỤỦŨƯỪỨỰỬỮỲÝỴỶỸĐ][\p{L}\s,-]{1,40}/giu,
+      ' ',
+    );
+
+    if (!updatedFields.destination) {
+      for (const item of KNOWN_DESTINATIONS) {
+        if (item.pattern.test(textForDestination)) {
+          updatedFields.destination = item.canonical;
+          break;
+        }
       }
     }
     if (
@@ -2010,8 +2442,8 @@ export class TripRequirementParser {
       }
     }
     if (!updatedFields.destination) {
-      const customDestMatch = text.match(
-        /(?:trekking|camping|cắm\s+trại|tham\s+quan|leo\s+núi|đi\s+phượt|đến|tới|tại)\s+([A-ZÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴÈÉẸẺẼÊỀẾỆỂỄÌÍỊỈĨÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠÙÚỤỦŨƯỪỨỰỬỮỲÝỴỶỸĐ][\p{L}\s-]{1,30})/u,
+      const customDestMatch = textForDestination.match(
+        /(?:trekking|camping|cắm\s+trại|tham\s+quan|leo\s+núi|đi\s+phượt|đến|tới|tại)\s+([A-ZÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴÈÉẸẺẼÊỀẾỆỂỄÌÍỊỈĨÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠÙÚỤỦŨƯỪỨỰỬỮỲÝỴỶỸĐ][\p{L}\s-]{1,40})/u,
       );
       if (customDestMatch?.[1]) {
         const cleaned = customDestMatch[1]
@@ -2023,6 +2455,19 @@ export class TripRequirementParser {
         if (cleaned.length >= 2) {
           updatedFields.destination = cleaned;
         }
+      }
+    }
+
+    // Update environment when switching explicitly to non-coastal forest/mountain park or coastal spot
+    if (updatedFields.destination && !updatedFields.environment) {
+      if (/vườn\s*quốc\s*gia/i.test(updatedFields.destination)) {
+        updatedFields.environment = 'FOREST';
+      } else if (
+        /vịnh\s*lan\s*hạ|cô\s*tô|phú\s*quốc/i.test(updatedFields.destination) ||
+        (updatedFields.destination === 'Cát Bà' &&
+          (updatedFields.activity === ActivityType.BEACH || hasCoastalCue))
+      ) {
+        updatedFields.environment = 'COASTAL';
       }
     }
 
@@ -2309,17 +2754,35 @@ export class TripRequirementParser {
     if (asksPreliminaryGearTip) {
       const tipDest = updatedFields.destination || currentTripState.destination;
       const tipAct = updatedFields.activity || currentTripState.activity;
-      if (tipDest === 'Yên Tử' || tipAct === ActivityType.TREKKING) {
+      const tipEnv = updatedFields.environment || currentTripState.environment;
+      if (tipAct === ActivityType.BEACH) {
+        preliminaryGearSuggestion =
+          'Với chuyến đi biển ban ngày, bạn nên chuẩn bị sơ bộ: đồ bơi, khăn tắm nhanh khô, dép đi biển, kem chống nắng SPF50+, kính râm, túi khô chống nước và nước uống.';
+      } else if (tipAct === ActivityType.CAMPING) {
+        preliminaryGearSuggestion =
+          tipEnv === 'COASTAL'
+            ? 'Gợi ý đồ cơ bản cho cắm trại ven biển gồm: lều chống gió có cọc neo cát, tấm bạt/tăng che nắng gió, túi ngủ mỏng & thảm cách ẩm, đèn trại, bếp dã ngoại, kem chống nắng và nước uống.'
+            : 'Gợi ý đồ cơ bản cho cắm trại gồm: lều chống mưa, túi ngủ/tấm lót cách nhiệt, đèn pin, ghế xếp, bếp dã ngoại và nước uống.';
+      } else if (tipAct === ActivityType.SIGHTSEEING) {
+        preliminaryGearSuggestion =
+          'Với chuyến tham quan, bạn nên mang theo balo gọn nhẹ, giày đi bộ êm chân, sạc dự phòng, kem chống nắng/mũ nón, áo khoác nhẹ và nước uống.';
+      } else if (tipAct === ActivityType.MOTORBIKE_TOUR) {
+        preliminaryGearSuggestion =
+          'Với phượt xe máy, ưu tiên mũ bảo hiểm 3/4 hoặc Fullface, găng tay bảo hộ, áo mưa bộ, dây ràng hành lý, túi chống nước, bộ vá xe cơ bản và đèn pin.';
+      } else if (tipAct === ActivityType.MOUNTAINEERING) {
+        preliminaryGearSuggestion =
+          'Với leo núi kỹ thuật, cần giày leo núi cổ cao đế bám, gậy leo núi, đèn đội đầu, áo giữ nhiệt/hardshell, găng tay bám đá, túi sơ cứu và nước điện giải.';
+      } else if (tipAct === ActivityType.BACKPACKING) {
+        preliminaryGearSuggestion =
+          'Với du lịch bụi tự túc, bạn nên chuẩn bị balo chính 35L–50L, túi giấy tờ/ổ khóa nhỏ, quần áo nhanh khô, sạc dự phòng, giày bền nhẹ và túi y tế.';
+      } else if (tipDest === 'Yên Tử' || tipAct === ActivityType.TREKKING) {
         preliminaryGearSuggestion =
           'Với hành trình leo núi / tham quan địa hình bậc đá như Yên Tử, bạn nên chuẩn bị sơ bộ: giày bám tốt, balo nhẹ 20–30L, nước uống, áo gió/áo mưa mỏng và gậy leo núi nếu đi bộ toàn tuyến.';
-      } else if (tipAct === ActivityType.CAMPING || tipAct === ActivityType.BEACH_CAMPING) {
-        preliminaryGearSuggestion =
-          'Gợi ý đồ cơ bản cho cắm trại gồm: lều chống mưa, túi ngủ/tấm lót cách nhiệt, đèn pin, ghế xếp, bàn nhỏ và nước uống.';
       } else {
         preliminaryGearSuggestion =
-          'Với chuyến đi ngoài trời tại ' +
+          'Với chuyến đi tại ' +
           (tipDest || 'điểm đến này') +
-          ', nhóm đồ thiết yếu thường gồm balo gọn nhẹ, giày thể thao/bám tốt, áo khoác mỏng, áo mưa và nước uống.';
+          ', nhóm đồ gọn nhẹ cơ bản gồm balo cá nhân, túi y tế cơ bản, sạc dự phòng, áo khoác mỏng/áo mưa dự phòng và nước uống.';
       }
     }
 
@@ -2348,6 +2811,10 @@ export class TripRequirementParser {
       readChecklistCodes: analyzed.readChecklistCodes,
       requestChecklistPrint: analyzed.requestChecklistPrint,
       requestChecklistCreate: analyzed.requestChecklistCreate,
+      requestMissingItemsList: analyzed.requestMissingItemsList,
+      requestRentalGearMatch: analyzed.requestRentalGearMatch,
+      requestSavedSpotsRead: analyzed.requestSavedSpotsRead,
+      requestSpotSuggestions: analyzed.requestSpotSuggestions,
       preliminaryGearSuggestion,
       ambiguousDateNote,
     };
@@ -2679,6 +3146,24 @@ export class TripRequirementParser {
     const currentYear = parseInt(vnParts[0], 10);
     const currentMonth = parseInt(vnParts[1], 10);
     const currentDay = parseInt(vnParts[2], 10);
+
+    // Explicit YYYY-MM-DD or YYYY/MM/DD (ISO format)
+    const isoDateMatch = lower.match(/\b(20\d{2})[/-](\d{1,2})[/-](\d{1,2})\b/);
+    if (isoDateMatch) {
+      const y = parseInt(isoDateMatch[1], 10);
+      const m = parseInt(isoDateMatch[2], 10);
+      const d = parseInt(isoDateMatch[3], 10);
+      if (this.isValidCalendarDate(y, m, d)) {
+        return {
+          isoDate: `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`,
+          ambiguousNote: null,
+        };
+      }
+      return {
+        isoDate: null,
+        ambiguousNote: `Ngày ${d}/${m}/${y} không tồn tại trên lịch. Bạn vui lòng xác nhận lại ngày khởi hành chính xác nhé.`,
+      };
+    }
 
     // Explicit DD/MM/YYYY or DD-MM-YYYY
     const fullDateMatch = lower.match(

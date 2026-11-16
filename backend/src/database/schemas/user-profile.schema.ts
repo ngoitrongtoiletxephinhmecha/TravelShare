@@ -37,8 +37,8 @@ export class User {
   })
   email: string;
 
-  @Prop({ required: true, select: false })
-  passwordHash: string;
+  @Prop({ required: false, select: false })
+  passwordHash?: string;
 
   @Prop({
     type: String,
@@ -70,6 +70,9 @@ export class User {
 
   @Prop({ type: [RefreshSession], default: [], select: false })
   refreshSessions: RefreshSession[];
+
+  @Prop({ default: false, index: true })
+  isDemo: boolean;
 
   @Prop()
   lastLoginAt?: Date;

@@ -18,6 +18,9 @@ export interface CreateBookingPayload {
   endAt: string;
   quantity?: number;
   renterNote?: string;
+  expectedPricePerDay?: number;
+  expectedDepositAmount?: number;
+  expectedSharingType?: 'RENT' | 'FREE_LOAN' | 'BOTH';
 }
 
 export interface SubmitHandoverPayload {

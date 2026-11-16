@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { useAuthStore } from '../store/auth.store';
 import { authService } from '../services/auth.service';
+import { refreshSessionSingleFlight } from '../services/api';
 import { notificationService } from '../services/notification.service';
 import { chatService } from '../services/chat.service';
 import { socketService } from '../services/socket.service';
@@ -37,11 +38,19 @@ const NAV_ITEMS = [
 ];
 
 export const MainLayout: React.FC = () => {
-  const { user, isAuthenticated, clearAuth } = useAuthStore();
+  const { user, accessToken, isAuthenticated, clearAuth } = useAuthStore();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+
+  useEffect(() => {
+    if (isAuthenticated && !accessToken) {
+      refreshSessionSingleFlight().catch(() => {
+        // clearAuth already handled by refreshSessionSingleFlight
+      });
+    }
+  }, [isAuthenticated, accessToken]);
 
   const { data: unreadNotifData } = useQuery({
     queryKey: ['notifications-unread-count'],
@@ -69,7 +78,17 @@ export const MainLayout: React.FC = () => {
       return;
     }
 
+    if (!accessToken) {
+      return;
+    }
+
     socketService.connect();
+
+    const resyncFromRest = () => {
+      queryClient.invalidateQueries({ queryKey: ['notifications-unread-count'] });
+      queryClient.invalidateQueries({ queryKey: ['notifications'] });
+      queryClient.invalidateQueries({ queryKey: ['chat-conversations'] });
+    };
 
     const unsubNotif = socketService.onNewNotification(() => {
       queryClient.invalidateQueries({ queryKey: ['notifications-unread-count'] });
@@ -81,16 +100,33 @@ export const MainLayout: React.FC = () => {
     });
 
     const unsubReconnect = socketService.onReconnect(() => {
-      queryClient.invalidateQueries({ queryKey: ['notifications-unread-count'] });
-      queryClient.invalidateQueries({ queryKey: ['chat-conversations'] });
+      resyncFromRest();
     });
+
+    const unsubAuthError = socketService.onAuthError((err) => {
+      if (err.code === 'ACCOUNT_LOCKED' || err.code === 'SESSION_REVOKED') {
+        navigate(
+          `/login?sessionError=${encodeURIComponent(err.message || 'Phiên đăng nhập không còn hiệu lực')}`,
+          { replace: true },
+        );
+      }
+    });
+
+    const handleOnline = () => {
+      socketService.connect();
+      resyncFromRest();
+    };
+
+    window.addEventListener('online', handleOnline);
 
     return () => {
       unsubNotif();
       unsubMsg();
       unsubReconnect();
+      unsubAuthError();
+      window.removeEventListener('online', handleOnline);
     };
-  }, [isAuthenticated, queryClient]);
+  }, [isAuthenticated, accessToken, queryClient, navigate]);
 
   const handleLogout = async () => {
     try {

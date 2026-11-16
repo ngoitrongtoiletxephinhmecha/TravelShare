@@ -3,13 +3,17 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  OnModuleDestroy,
   OnModuleInit,
+  Optional,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import {
   Notification,
   NotificationDocument,
+  OutboxEvent,
+  OutboxEventDocument,
 } from '../../database/schemas';
 import { NotificationType } from '../../common/enums/system.enums';
 import {
@@ -24,20 +28,42 @@ export type RealtimeNotificationDispatcher = (
 ) => void;
 
 @Injectable()
-export class NotificationsService implements OnModuleInit {
+export class NotificationsService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(NotificationsService.name);
   private realtimeDispatcher?: RealtimeNotificationDispatcher;
+  private outboxInterval?: ReturnType<typeof setInterval>;
+  private isRecoveringOutbox = false;
 
   constructor(
     @InjectModel(Notification.name)
     private notificationModel: Model<NotificationDocument>,
     private readonly bookingEventsService: BookingEventsService,
+    @Optional()
+    @InjectModel(OutboxEvent.name)
+    private readonly outboxModel?: Model<OutboxEventDocument>,
   ) {}
 
   onModuleInit() {
     this.bookingEventsService.onEvent(async (payload) => {
-      await this.handleBookingDomainEvent(payload);
+      await this.processBookingEventWithOutbox(payload);
     });
+
+    if (this.outboxModel) {
+      void this.recoverPendingOutboxEvents();
+      this.outboxInterval = setInterval(() => {
+        void this.recoverPendingOutboxEvents();
+      }, 15000);
+      if (typeof this.outboxInterval.unref === 'function') {
+        this.outboxInterval.unref();
+      }
+    }
+  }
+
+  onModuleDestroy() {
+    if (this.outboxInterval) {
+      clearInterval(this.outboxInterval);
+      this.outboxInterval = undefined;
+    }
   }
 
   registerRealtimeDispatcher(dispatcher: RealtimeNotificationDispatcher) {
@@ -296,9 +322,94 @@ export class NotificationsService implements OnModuleInit {
       this.logger.error(
         `Failed to process booking notification for ${bookingId}: ${String(err)}`,
       );
+      throw err;
     }
 
     return createdList;
+  }
+
+  async processBookingEventWithOutbox(
+    payload: BookingDomainEventPayload,
+  ): Promise<Record<string, any>[]> {
+    const outboxFilter = payload.outboxId
+      ? { _id: new Types.ObjectId(payload.outboxId) }
+      : {
+          transitionKey: BookingEventsService.buildTransitionKey(payload),
+        };
+
+    try {
+      const notifications = await this.handleBookingDomainEvent(payload);
+      if (this.outboxModel) {
+        await this.outboxModel.updateOne(outboxFilter, {
+          $set: {
+            status: 'PROCESSED',
+            processedAt: new Date(),
+            lastError: undefined,
+          },
+        });
+      }
+      return notifications;
+    } catch (err) {
+      if (this.outboxModel) {
+        try {
+          const existing = await this.outboxModel.findOne(outboxFilter).lean();
+          const nextAttempts = (existing?.attempts || 0) + 1;
+          await this.outboxModel.updateOne(outboxFilter, {
+            $set: {
+              status: nextAttempts >= 10 ? 'FAILED' : 'PENDING',
+              attempts: nextAttempts,
+              nextAttemptAt: new Date(
+                Date.now() + Math.min(60_000, nextAttempts * 5000),
+              ),
+              lastError: String(err).slice(0, 500),
+            },
+          });
+        } catch {
+          // ignore outbox update error
+        }
+      }
+      return [];
+    }
+  }
+
+  async recoverPendingOutboxEvents(limit = 50): Promise<number> {
+    if (!this.outboxModel || this.isRecoveringOutbox) return 0;
+    this.isRecoveringOutbox = true;
+    let recovered = 0;
+
+    try {
+      const now = new Date();
+      const pending = await this.outboxModel
+        .find({
+          status: 'PENDING',
+          nextAttemptAt: { $lte: now },
+        })
+        .sort({ createdAt: 1 })
+        .limit(limit)
+        .lean();
+
+      for (const item of pending) {
+        await this.processBookingEventWithOutbox({
+          event: item.eventType as any,
+          bookingId: String(item.bookingId),
+          gearId: String(item.gearId),
+          renterId: String(item.renterId),
+          ownerId: String(item.ownerId),
+          actorId: String(item.actorId),
+          occurredAt: new Date(item.occurredAt || Date.now()).toISOString(),
+          outboxId: String(item._id),
+          transitionKey: item.transitionKey,
+          metadata: item.metadata || {},
+        });
+        recovered += 1;
+      }
+    } catch (err) {
+      this.logger.warn(`Outbox recovery sweep warning: ${String(err)}`);
+    } finally {
+      this.isRecoveringOutbox = false;
+    }
+
+    return recovered;
   }
 
   async getMyNotifications(

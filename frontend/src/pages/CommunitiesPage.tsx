@@ -21,12 +21,13 @@ import {
 } from '../components/ui/DesignSystem';
 
 const ACTIVITY_OPTIONS: { value: ActivityType; label: string }[] = [
-  { value: 'TREKKING', label: 'Trekking / Leo núi' },
-  { value: 'CAMPING', label: 'Camping / Dã ngoại' },
+  { value: 'TREKKING', label: 'Trekking / Đi bộ đường dài' },
+  { value: 'CAMPING', label: 'Camping / Cắm trại' },
   { value: 'MOTORBIKE_TOUR', label: 'Phượt xe máy' },
   { value: 'BACKPACKING', label: 'Du lịch bụi' },
-  { value: 'MOUNTAINEERING', label: 'Chinh phục đỉnh cao' },
-  { value: 'BEACH_CAMPING', label: 'Cắm trại biển' },
+  { value: 'MOUNTAINEERING', label: 'Leo núi kỹ thuật' },
+  { value: 'BEACH', label: 'Đi biển' },
+  { value: 'SIGHTSEEING', label: 'Tham quan' },
   { value: 'OTHER', label: 'Khác' },
 ];
 

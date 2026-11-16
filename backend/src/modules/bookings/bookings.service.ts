@@ -4,9 +4,10 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model, Types } from 'mongoose';
+import { ClientSession, Model, Types } from 'mongoose';
 import {
   Booking,
   BookingAuditEntry,
@@ -33,9 +34,16 @@ import {
   HandoverType,
   UserRole,
 } from '../../common/enums/system.enums';
-import { AvailabilityService } from '../gear/availability.service';
+import {
+  AvailabilityService,
+  HOLDING_BOOKING_STATUSES,
+} from '../gear/availability.service';
 import { BookingStateMachine } from './booking-state-machine';
-import { BookingEventsService } from './booking-events.service';
+import {
+  BookingDomainEventPayload,
+  BookingEventsService,
+} from './booking-events.service';
+import { MediaService } from '../media/media.service';
 import {
   ApproveBookingDto,
   CancelBookingDto,
@@ -48,17 +56,8 @@ import {
   SubmitHandoverDto,
 } from './dto/booking.dto';
 
-const HOLDING_STATUSES: BookingStatus[] = [
-  BookingStatus.APPROVED,
-  BookingStatus.IN_USE,
-  BookingStatus.RETURN_PENDING,
-];
-
 @Injectable()
 export class BookingsService {
-  // Per-gear in-process serialization queue to complement DB conditional OCC updates
-  private readonly gearLocks = new Map<string, Promise<void>>();
-
   constructor(
     @InjectModel(Booking.name) private bookingModel: Model<BookingDocument>,
     @InjectModel(GearItem.name) private gearModel: Model<GearItemDocument>,
@@ -68,64 +67,14 @@ export class BookingsService {
     @InjectModel(Profile.name) private profileModel: Model<ProfileDocument>,
     private readonly availabilityService: AvailabilityService,
     private readonly eventsService: BookingEventsService,
+    @Optional() private readonly mediaService?: MediaService,
   ) {}
 
-  /**
-   * Run a critical section serialized per gearId
-   */
-  private async withGearLock<T>(
-    gearId: string,
-    fn: () => Promise<T>,
-  ): Promise<T> {
-    const prev = this.gearLocks.get(gearId) || Promise.resolve();
-    let release!: () => void;
-    const current = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    this.gearLocks.set(
-      gearId,
-      prev.then(() => current),
-    );
-
-    await prev;
-    try {
-      return await fn();
-    } finally {
-      release();
-      if (this.gearLocks.get(gearId) === current) {
-        this.gearLocks.delete(gearId);
-      }
+  private attachSession<T>(query: T, session?: ClientSession | null): T {
+    if (session && query && typeof (query as any).session === 'function') {
+      (query as any).session(session);
     }
-  }
-
-  /**
-   * Calculate already-reserved quantity from active holding bookings in [startAt, endAt)
-   */
-  private async getHoldingBookingsQuantityInInterval(
-    gearId: string | Types.ObjectId,
-    startAt: Date,
-    endAt: Date,
-    excludeBookingId?: string | Types.ObjectId,
-  ): Promise<number> {
-    const filter: Record<string, any> = {
-      gearId: new Types.ObjectId(String(gearId)),
-      status: { $in: HOLDING_STATUSES },
-      startAt: { $lt: endAt },
-      endAt: { $gt: startAt },
-    };
-    if (excludeBookingId) {
-      filter._id = { $ne: new Types.ObjectId(String(excludeBookingId)) };
-    }
-
-    const overlapping = await this.bookingModel
-      .find(filter)
-      .select('quantity')
-      .lean();
-
-    return overlapping.reduce(
-      (sum, item: any) => sum + (Number(item.quantity) || 1),
-      0,
-    );
+    return query;
   }
 
   /**
@@ -144,12 +93,11 @@ export class BookingsService {
       throw new NotFoundException('Không tìm thấy thiết bị');
     }
 
-    if (
-      gear.status !== GearStatus.ACTIVE ||
-      gear.moderationStatus !== GearModerationStatus.APPROVED
-    ) {
+    const eligibility = this.availabilityService.isGearEligibleForBooking(gear);
+    if (!eligibility.eligible) {
       throw new BadRequestException(
-        'Thiết bị hiện không ở trạng thái hoạt động (ACTIVE) để nhận yêu cầu thuê/mượn',
+        eligibility.reason ||
+          'Thiết bị hiện không ở trạng thái hoạt động (ACTIVE) để nhận yêu cầu thuê/mượn',
       );
     }
 
@@ -162,14 +110,6 @@ export class BookingsService {
     const { startAt, endAt, rentalDays } =
       this.availabilityService.parseAndValidateInterval(dto.startAt, dto.endAt);
 
-    const minDays = gear.availabilitySettings?.minRentalDays ?? 1;
-    const maxDays = gear.availabilitySettings?.maxRentalDays ?? 30;
-    if (rentalDays < minDays || rentalDays > maxDays) {
-      throw new BadRequestException(
-        `Số ngày thuê (${rentalDays} ngày) phải nằm trong khoảng cho phép của chủ đồ: từ ${minDays} đến ${maxDays} ngày`,
-      );
-    }
-
     const quantity = Math.max(1, Number(dto.quantity) || 1);
     const totalGearQty = gear.totalQuantity || 1;
     if (quantity > totalGearQty) {
@@ -178,37 +118,48 @@ export class BookingsService {
       );
     }
 
-    // Check overlap on [startAt, endAt): existing.startAt < requested.endAt && existing.endAt > requested.startAt
-    const [ownerBlockedQty, holdingBookingsQty] = await Promise.all([
-      this.availabilityService.getOwnerBlockedQuantityInInterval(
-        gear._id,
+    const evaluation =
+      await this.availabilityService.evaluateGearAvailabilityAndQuote({
+        gear,
         startAt,
         endAt,
-      ),
-      this.getHoldingBookingsQuantityInInterval(gear._id, startAt, endAt),
-    ]);
+        rentalDays,
+        requestedQuantity: quantity,
+        enforceDurationRules: true,
+        enforceAdvanceNotice: true,
+      });
 
-    const availableQty = Math.max(
-      0,
-      totalGearQty - Math.max(ownerBlockedQty, holdingBookingsQty),
-    );
-    if (availableQty < quantity) {
-      throw new ConflictException(
-        `Khoảng thời gian [${startAt.toISOString()} → ${endAt.toISOString()}) không còn đủ số lượng thiết bị trống (Còn trống: ${availableQty}/${totalGearQty})`,
-      );
+    if (!evaluation.isDurationValid) {
+      throw new BadRequestException(evaluation.durationInvalidReason);
     }
 
-    // Calculate pricing server-side (never trust client rentalTotal)
-    const isFreeLoan = gear.sharingType === GearListingType.FREE_LOAN;
-    const priceSnapshot = isFreeLoan
-      ? 0
-      : Math.max(0, Number(gear.pricePerDay ?? gear.dailyPriceVnd ?? 0));
-    const rentalTotal = isFreeLoan ? 0 : priceSnapshot * rentalDays * quantity;
-    const unitDeposit = Math.max(
-      0,
-      Number(gear.depositAmount ?? gear.depositAmountVnd ?? 0),
-    );
-    const depositAmount = unitDeposit * quantity;
+    // Detect stale pricing/listing changes compared to matching snapshot
+    if (
+      (dto.expectedPricePerDay !== undefined &&
+        Number(dto.expectedPricePerDay) !== evaluation.quote.pricePerDay) ||
+      (dto.expectedDepositAmount !== undefined &&
+        Number(dto.expectedDepositAmount) !== evaluation.quote.depositPerUnit) ||
+      (dto.expectedSharingType !== undefined &&
+        dto.expectedSharingType !== evaluation.quote.sharingType)
+    ) {
+      throw new ConflictException({
+        code: 'MATCH_DATA_STALE',
+        message:
+          'Thông tin giá thuê, tiền cọc hoặc hình thức chia sẻ của thiết bị đã thay đổi sau khi tìm kiếm. Vui lòng kiểm tra báo giá mới hoặc tìm lại thiết bị phù hợp.',
+      });
+    }
+
+    if (evaluation.availableQuantity < quantity) {
+      throw new ConflictException({
+        code: 'AVAILABILITY_CHANGED',
+        message: `Khoảng thời gian [${startAt.toISOString()} → ${endAt.toISOString()}) không còn đủ số lượng thiết bị trống (Còn trống: ${evaluation.availableQuantity}/${totalGearQty}). Vui lòng chọn lịch khác hoặc tìm lại thiết bị.`,
+      });
+    }
+
+    // Server-side price snapshot (never trust client totals; existing bookings preserve this snapshot)
+    const priceSnapshot = evaluation.quote.pricePerDay;
+    const rentalTotal = evaluation.quote.totalRentalFee;
+    const depositAmount = evaluation.quote.depositAmount;
 
     const now = new Date();
     const expiresAt = new Date(
@@ -261,7 +212,7 @@ export class BookingsService {
       statusHistory: [initialAudit],
     });
 
-    this.eventsService.emit({
+    await this.eventsService.recordAndDispatch({
       event: 'booking.requested',
       bookingId: String(created._id),
       gearId: String(gear._id),
@@ -311,10 +262,18 @@ export class BookingsService {
 
     const gearIdStr = String(initialBooking.gearId);
 
-    return this.withGearLock(gearIdStr, async () => {
-      const MAX_RETRIES = 5;
-      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-        const booking = await this.bookingModel.findById(bookingId).lean();
+    const txOutcome =
+      await this.availabilityService.runGearReservationTransaction<{
+        expired?: boolean;
+        bookingId?: string;
+        renterId?: string;
+        ownerId?: string;
+        approvedAtIso?: string;
+        outboxPayload?: BookingDomainEventPayload;
+      }>(gearIdStr, async ({ gear, session }) => {
+        const bkQ = this.bookingModel.findById(bookingId);
+        this.attachSession(bkQ, session);
+        const booking = await bkQ.lean();
         if (!booking) {
           throw new NotFoundException('Không tìm thấy giao dịch');
         }
@@ -325,67 +284,77 @@ export class BookingsService {
           actorRole,
         );
 
-        const gear = await this.gearModel.findById(booking.gearId).lean();
-        if (!gear || gear.status !== GearStatus.ACTIVE) {
-          throw new BadRequestException(
-            'Thiết bị không còn ở trạng thái hoạt động (ACTIVE) để duyệt giao dịch',
-          );
-        }
-
+        const now = new Date();
         const startAt = new Date(booking.startAt || booking.startDate);
         const endAt = new Date(booking.endAt || booking.endDate);
-        const requestedQty = Number(booking.quantity) || 1;
-        const totalGearQty = Number(gear.totalQuantity) || 1;
 
-        // Re-check overlap on [startAt, endAt)
-        const [ownerBlockedQty, holdingBookingsQty] = await Promise.all([
-          this.availabilityService.getOwnerBlockedQuantityInInterval(
-            gear._id,
-            startAt,
-            endAt,
-          ),
-          this.getHoldingBookingsQuantityInInterval(
-            gear._id,
-            startAt,
-            endAt,
-            booking._id,
-          ),
-        ]);
+        // Check expiration directly inside approval transaction flow
+        if (
+          (booking.expiresAt && new Date(booking.expiresAt) <= now) ||
+          endAt <= now
+        ) {
+          const expireAudit: BookingAuditEntry = {
+            fromStatus: BookingStatus.PENDING,
+            toStatus: BookingStatus.EXPIRED,
+            actorId: 'SYSTEM',
+            actorRole: 'SYSTEM',
+            note: 'Yêu cầu thuê đã hết hạn xử lý khi chủ thiết bị duyệt',
+            timestamp: now,
+          };
+          const expireOpts = session
+            ? { new: true, session }
+            : { new: true };
+          await this.bookingModel
+            .findOneAndUpdate(
+              { _id: booking._id, status: BookingStatus.PENDING },
+              {
+                $set: { status: BookingStatus.EXPIRED },
+                $push: { statusHistory: expireAudit },
+              },
+              expireOpts,
+            )
+            .lean();
 
-        const alreadyReserved = Math.max(ownerBlockedQty, holdingBookingsQty);
-        if (alreadyReserved + requestedQty > totalGearQty) {
-          throw new ConflictException(
-            'Không thể duyệt yêu cầu: Khoảng ngày này đã được duyệt cho người thuê khác hoặc vượt quá số lượng thiết bị khả dụng',
+          return {
+            result: { expired: true },
+            bumpVersion: true,
+          };
+        }
+
+        const eligibility =
+          this.availabilityService.isGearEligibleForBooking(gear);
+        if (!eligibility.eligible) {
+          throw new BadRequestException(
+            eligibility.reason ||
+              'Thiết bị không còn ở trạng thái hoạt động (ACTIVE & APPROVED) để duyệt giao dịch',
           );
         }
 
-        // Optimistic Concurrency Control (OCC): atomically bump gear.reservationVersion
-        const currentVersion = Number(gear.reservationVersion) || 0;
-        const lockedGear = await this.gearModel.findOneAndUpdate(
-          {
-            _id: gear._id,
-            status: GearStatus.ACTIVE,
-            $or: [
-              { reservationVersion: currentVersion },
-              ...(currentVersion === 0
-                ? [{ reservationVersion: { $exists: false } }]
-                : []),
-            ],
-          },
-          { $inc: { reservationVersion: 1 } },
-          { new: true },
-        );
+        const requestedQty = Number(booking.quantity) || 1;
+        const { rentalDays } =
+          this.availabilityService.parseAndValidateInterval(startAt, endAt, {
+            disallowPast: false,
+          });
 
-        if (!lockedGear) {
-          if (attempt === MAX_RETRIES) {
-            throw new ConflictException(
-              'Xung đột cập nhật đồng thời (Write Conflict), vui lòng thử lại',
-            );
-          }
-          continue;
+        const evaluation =
+          await this.availabilityService.evaluateGearAvailabilityAndQuote({
+            gear,
+            startAt,
+            endAt,
+            rentalDays,
+            requestedQuantity: requestedQty,
+            excludeBookingId: booking._id as any,
+            enforceDurationRules: false,
+            enforceAdvanceNotice: false,
+            session,
+          });
+
+        if (evaluation.availableQuantity < requestedQty) {
+          throw new ConflictException(
+            'Không thể duyệt yêu cầu: Khoảng ngày này đã được duyệt/khóa cho người thuê khác hoặc vượt quá số lượng thiết bị khả dụng',
+          );
         }
 
-        const now = new Date();
         const auditEntry: BookingAuditEntry = {
           fromStatus: BookingStatus.PENDING,
           toStatus: BookingStatus.APPROVED,
@@ -395,7 +364,8 @@ export class BookingsService {
           timestamp: now,
         };
 
-        // Conditional atomic transition on Booking: PENDING -> APPROVED
+        // Conditional atomic transition on Booking: PENDING -> APPROVED inside transaction
+        const updOpts = session ? { new: true, session } : { new: true };
         const updatedBooking = await this.bookingModel
           .findOneAndUpdate(
             {
@@ -407,10 +377,13 @@ export class BookingsService {
                 status: BookingStatus.APPROVED,
                 approvedAt: now,
                 ...(dto?.note ? { ownerResponseNote: dto.note.trim() } : {}),
+                ...(dto?.internalNote
+                  ? { ownerInternalNote: dto.internalNote.trim() }
+                  : {}),
               },
               $push: { statusHistory: auditEntry },
             },
-            { new: true },
+            updOpts,
           )
           .lean();
 
@@ -420,31 +393,75 @@ export class BookingsService {
           );
         }
 
-        // Record BOOKED slot in GearAvailability
-        await this.availabilityService.recordBookedSlot({
-          gearId: new Types.ObjectId(String(gear._id)),
-          bookingId: new Types.ObjectId(String(booking._id)),
-          startAt,
-          endAt,
-          quantity: requestedQty,
-          note: `Giữ lịch cho đơn thuê #${String(booking._id).slice(-6)}`,
-        });
+        // Write BOOKED slot in same MongoDB transaction; if no session (mock unit test), compensate cleanly on error
+        try {
+          await this.availabilityService.recordBookedSlot(
+            {
+              gearId: new Types.ObjectId(String(gear._id)),
+              bookingId: new Types.ObjectId(String(booking._id)),
+              startAt,
+              endAt,
+              quantity: requestedQty,
+              note: `Giữ lịch cho đơn thuê #${String(booking._id).slice(-6)}`,
+            },
+            session,
+          );
+        } catch (slotErr) {
+          if (!session) {
+            await this.bookingModel
+              .findOneAndUpdate(
+                { _id: booking._id, status: BookingStatus.APPROVED },
+                { $set: { status: BookingStatus.PENDING, approvedAt: null } },
+              )
+              .lean();
+          }
+          throw slotErr;
+        }
 
-        this.eventsService.emit({
-          event: 'booking.approved',
-          bookingId: String(booking._id),
-          gearId: String(gear._id),
-          renterId: String(booking.renterId),
-          ownerId: String(booking.ownerId),
-          actorId: String(userId),
-          occurredAt: now.toISOString(),
-        });
+        const outboxPayload = await this.eventsService.recordOutbox(
+          {
+            event: 'booking.approved',
+            bookingId: String(booking._id),
+            gearId: gearIdStr,
+            renterId: String(booking.renterId),
+            ownerId: String(booking.ownerId),
+            actorId: String(userId),
+            occurredAt: now.toISOString(),
+          },
+          session,
+        );
 
-        return this.getBookingById(String(booking._id), userId, userRole);
-      }
+        return {
+          result: {
+            bookingId: String(booking._id),
+            renterId: String(booking.renterId),
+            ownerId: String(booking.ownerId),
+            approvedAtIso: now.toISOString(),
+            outboxPayload,
+          },
+          bumpVersion: true,
+        };
+      });
 
-      throw new ConflictException('Không thể hoàn tất duyệt đơn do xung đột');
-    });
+    if (txOutcome.expired) {
+      throw new BadRequestException(
+        'Yêu cầu thuê đã hết hạn chờ duyệt (EXPIRED), không thể chấp nhận giao dịch này',
+      );
+    }
+
+    this.eventsService.emit(
+      txOutcome.outboxPayload || {
+        event: 'booking.approved',
+        bookingId: txOutcome.bookingId!,
+        gearId: gearIdStr,
+        renterId: txOutcome.renterId!,
+        ownerId: txOutcome.ownerId!,
+        actorId: String(userId),
+        occurredAt: txOutcome.approvedAtIso!,
+      },
+    );
+
+    return this.getBookingById(txOutcome.bookingId!, userId, userRole);
   }
 
   /**
@@ -506,7 +523,7 @@ export class BookingsService {
       throw new ConflictException('Trạng thái giao dịch đã thay đổi');
     }
 
-    this.eventsService.emit({
+    await this.eventsService.recordAndDispatch({
       event: 'booking.rejected',
       bookingId: String(booking._id),
       gearId: String(booking.gearId),
@@ -558,38 +575,66 @@ export class BookingsService {
       timestamp: now,
     };
 
-    const updated = await this.bookingModel
-      .findOneAndUpdate(
-        { _id: booking._id, status: booking.status },
-        {
-          $set: {
-            status: BookingStatus.CANCELLED,
-            cancellationReason: dto.reason.trim(),
-            cancelledBy: new Types.ObjectId(String(userId)),
-          },
-          $push: { statusHistory: auditEntry },
+    const cancelOutboxPayload =
+      await this.availabilityService.runGearReservationTransaction<BookingDomainEventPayload>(
+        String(booking.gearId),
+        async ({ session }) => {
+          const currentBkQ = this.bookingModel.findById(booking._id);
+          this.attachSession(currentBkQ, session);
+          const latestBk = await currentBkQ.lean();
+          if (!latestBk) {
+            throw new NotFoundException('Không tìm thấy giao dịch');
+          }
+          BookingStateMachine.assertValidTransition(
+            latestBk.status,
+            BookingStatus.CANCELLED,
+            actorRole,
+          );
+
+          const opts = session ? { new: true, session } : { new: true };
+          const updated = await this.bookingModel
+            .findOneAndUpdate(
+              { _id: latestBk._id, status: latestBk.status },
+              {
+                $set: {
+                  status: BookingStatus.CANCELLED,
+                  cancellationReason: dto.reason.trim(),
+                  cancelledBy: new Types.ObjectId(String(userId)),
+                },
+                $push: { statusHistory: auditEntry },
+              },
+              opts,
+            )
+            .lean();
+
+          if (!updated) {
+            throw new ConflictException('Trạng thái giao dịch đã thay đổi');
+          }
+
+          await this.availabilityService.releaseBookedSlot(
+            latestBk._id,
+            session,
+          );
+
+          const outboxPayload = await this.eventsService.recordOutbox(
+            {
+              event: 'booking.cancelled',
+              bookingId: String(booking._id),
+              gearId: String(booking.gearId),
+              renterId: String(booking.renterId),
+              ownerId: String(booking.ownerId),
+              actorId: String(userId),
+              occurredAt: now.toISOString(),
+              metadata: { reason: dto.reason.trim() },
+            },
+            session,
+          );
+
+          return { result: outboxPayload, bumpVersion: true };
         },
-        { new: true },
-      )
-      .lean();
+      );
 
-    if (!updated) {
-      throw new ConflictException('Trạng thái giao dịch đã thay đổi');
-    }
-
-    // Release booked slot so cancelled booking never continues occupying schedule
-    await this.availabilityService.releaseBookedSlot(booking._id);
-
-    this.eventsService.emit({
-      event: 'booking.cancelled',
-      bookingId: String(booking._id),
-      gearId: String(booking.gearId),
-      renterId: String(booking.renterId),
-      ownerId: String(booking.ownerId),
-      actorId: String(userId),
-      occurredAt: now.toISOString(),
-      metadata: { reason: dto.reason.trim() },
-    });
+    this.eventsService.emit(cancelOutboxPayload);
 
     return this.getBookingById(String(booking._id), userId, userRole);
   }
@@ -625,6 +670,7 @@ export class BookingsService {
         },
       );
       if (res) {
+        await this.availabilityService.releaseBookedSlot(item._id);
         expiredCount += 1;
       }
     }
@@ -684,19 +730,29 @@ export class BookingsService {
       );
     }
 
+    const validatedPhotos = this.mediaService
+      ? await this.mediaService.validateAndNormalizeBookingEvidenceUrls({
+          bookingId: String(booking._id),
+          actorId: String(userId),
+          actorRole: userRole,
+          urls: dto.photos,
+          scope: 'BOOKING_HANDOVER',
+        })
+      : dto.photos || [];
+
     const now = new Date();
     const newEntry: HandoverConfirmationEntry = {
       userId: String(userId),
       role: actorRole,
       confirmedAt: now,
       note: dto.notes?.trim() || '',
-      photos: dto.photos || [],
+      photos: validatedPhotos,
       condition: dto.condition || GearCondition.GOOD,
     };
     confirmations.push(newEntry);
 
     const mergedPhotos = Array.from(
-      new Set([...(existingHandover?.photos || []), ...(dto.photos || [])]),
+      new Set([...(existingHandover?.photos || []), ...validatedPhotos]),
     );
     const mergedConfirmedBy = confirmations.map(
       (c) => new Types.ObjectId(String(c.userId)),
@@ -751,7 +807,7 @@ export class BookingsService {
         },
       );
 
-      this.eventsService.emit({
+      await this.eventsService.recordAndDispatch({
         event: 'booking.handed_over',
         bookingId: String(booking._id),
         gearId: String(booking.gearId),
@@ -762,7 +818,7 @@ export class BookingsService {
         metadata: { stage: 'CONFIRMED' },
       });
     } else {
-      this.eventsService.emit({
+      await this.eventsService.recordAndDispatch({
         event: 'booking.handed_over',
         bookingId: String(booking._id),
         gearId: String(booking.gearId),
@@ -832,19 +888,29 @@ export class BookingsService {
       );
     }
 
+    const validatedPhotos = this.mediaService
+      ? await this.mediaService.validateAndNormalizeBookingEvidenceUrls({
+          bookingId: String(booking._id),
+          actorId: String(userId),
+          actorRole: userRole,
+          urls: dto.photos,
+          scope: 'BOOKING_HANDOVER',
+        })
+      : dto.photos || [];
+
     const now = new Date();
     const newEntry: HandoverConfirmationEntry = {
       userId: String(userId),
       role: actorRole,
       confirmedAt: now,
       note: dto.notes?.trim() || '',
-      photos: dto.photos || [],
+      photos: validatedPhotos,
       condition: dto.condition || GearCondition.GOOD,
     };
     confirmations.push(newEntry);
 
     const mergedPhotos = Array.from(
-      new Set([...(existingHandover?.photos || []), ...(dto.photos || [])]),
+      new Set([...(existingHandover?.photos || []), ...validatedPhotos]),
     );
     const mergedConfirmedBy = confirmations.map(
       (c) => new Types.ObjectId(String(c.userId)),
@@ -872,34 +938,68 @@ export class BookingsService {
     const hasRenterConfirmed = confirmations.some((c) => c.role === 'RENTER');
 
     if (hasOwnerConfirmed && hasRenterConfirmed) {
-      BookingStateMachine.assertValidTransition(
-        booking.status,
-        BookingStatus.COMPLETED,
-        actorRole,
-      );
+      const completedOutboxPayload =
+        await this.availabilityService.runGearReservationTransaction<BookingDomainEventPayload>(
+          String(booking.gearId),
+          async ({ session }) => {
+            const bkQ = this.bookingModel.findById(booking._id);
+            this.attachSession(bkQ, session);
+            const latestBk = await bkQ.lean();
+            if (!latestBk) {
+              throw new NotFoundException('Không tìm thấy giao dịch');
+            }
+            BookingStateMachine.assertValidTransition(
+              latestBk.status,
+              BookingStatus.COMPLETED,
+              actorRole,
+            );
 
-      const auditEntry: BookingAuditEntry = {
-        fromStatus: booking.status,
-        toStatus: BookingStatus.COMPLETED,
-        actorId: String(userId),
-        actorRole,
-        note: 'Cả hai bên đã xác nhận hoàn trả và kiểm tra thiết bị hoàn tất',
-        timestamp: now,
-      };
+            const auditEntry: BookingAuditEntry = {
+              fromStatus: latestBk.status,
+              toStatus: BookingStatus.COMPLETED,
+              actorId: String(userId),
+              actorRole,
+              note: 'Cả hai bên đã xác nhận hoàn trả và kiểm tra thiết bị hoàn tất',
+              timestamp: now,
+            };
 
-      await this.bookingModel.findOneAndUpdate(
-        { _id: booking._id, status: booking.status },
-        {
-          $set: {
-            status: BookingStatus.COMPLETED,
-            returnedAt: booking.returnedAt || now,
-            completedAt: now,
+            const opts = session ? { new: true, session } : { new: true };
+            const updated = await this.bookingModel.findOneAndUpdate(
+              { _id: latestBk._id, status: latestBk.status },
+              {
+                $set: {
+                  status: BookingStatus.COMPLETED,
+                  returnedAt: latestBk.returnedAt || now,
+                  completedAt: now,
+                },
+                $push: { statusHistory: auditEntry },
+              },
+              opts,
+            );
+            if (!updated) {
+              throw new ConflictException('Trạng thái giao dịch đã thay đổi');
+            }
+
+            await this.availabilityService.releaseBookedSlot(
+              latestBk._id,
+              session,
+            );
+
+            const outboxPayload = await this.eventsService.recordOutbox(
+              {
+                event: 'booking.completed',
+                bookingId: String(booking._id),
+                gearId: String(booking.gearId),
+                renterId: String(booking.renterId),
+                ownerId: String(booking.ownerId),
+                actorId: String(userId),
+                occurredAt: now.toISOString(),
+              },
+              session,
+            );
+            return { result: outboxPayload, bumpVersion: true };
           },
-          $push: { statusHistory: auditEntry },
-        },
-      );
-
-      await this.availabilityService.releaseBookedSlot(booking._id);
+        );
 
       await Promise.all([
         this.profileModel.updateOne(
@@ -912,15 +1012,7 @@ export class BookingsService {
         ),
       ]);
 
-      this.eventsService.emit({
-        event: 'booking.completed',
-        bookingId: String(booking._id),
-        gearId: String(booking.gearId),
-        renterId: String(booking.renterId),
-        ownerId: String(booking.ownerId),
-        actorId: String(userId),
-        occurredAt: now.toISOString(),
-      });
+      this.eventsService.emit(completedOutboxPayload);
     } else if (booking.status === BookingStatus.IN_USE) {
       BookingStateMachine.assertValidTransition(
         booking.status,
@@ -948,7 +1040,7 @@ export class BookingsService {
         },
       );
 
-      this.eventsService.emit({
+      await this.eventsService.recordAndDispatch({
         event: 'booking.returned',
         bookingId: String(booking._id),
         gearId: String(booking.gearId),
@@ -1315,13 +1407,23 @@ export class BookingsService {
       );
     }
 
+    const validatedEvidence = this.mediaService
+      ? await this.mediaService.validateAndNormalizeBookingEvidenceUrls({
+          bookingId: String(booking._id),
+          actorId: String(userId),
+          actorRole: userRole,
+          urls: dto.evidence,
+          scope: 'BOOKING_DISPUTE',
+        })
+      : dto.evidence || [];
+
     const createdDispute = await this.disputeModel.create({
       bookingId: booking._id,
       reporterId: new Types.ObjectId(String(userId)),
       reportedUserId: new Types.ObjectId(String(reportedUserId)),
       reason: dto.reason,
       description: dto.description.trim(),
-      evidence: dto.evidence || [],
+      evidence: validatedEvidence,
       status: DisputeStatus.OPEN,
     });
 
@@ -1432,25 +1534,36 @@ export class BookingsService {
         .findById(updated.bookingId)
         .lean();
       if (booking && booking.status === BookingStatus.DISPUTED) {
-        const auditEntry: BookingAuditEntry = {
-          fromStatus: BookingStatus.DISPUTED,
-          toStatus: BookingStatus.COMPLETED,
-          actorId: String(adminId),
-          actorRole: 'ADMIN',
-          note: `Admin đóng tranh chấp (${dto.status}): ${dto.adminNotes.trim()}`,
-          timestamp: now,
-        };
-        await this.bookingModel.updateOne(
-          { _id: booking._id },
-          {
-            $set: {
-              status: BookingStatus.COMPLETED,
-              completedAt: now,
-            },
-            $push: { statusHistory: auditEntry },
+        await this.availabilityService.runGearReservationTransaction(
+          String(booking.gearId),
+          async ({ session }) => {
+            const auditEntry: BookingAuditEntry = {
+              fromStatus: BookingStatus.DISPUTED,
+              toStatus: BookingStatus.COMPLETED,
+              actorId: String(adminId),
+              actorRole: 'ADMIN',
+              note: `Admin đóng tranh chấp (${dto.status}): ${dto.adminNotes.trim()}`,
+              timestamp: now,
+            };
+            const updOpts = session ? { session } : undefined;
+            await this.bookingModel.updateOne(
+              { _id: booking._id },
+              {
+                $set: {
+                  status: BookingStatus.COMPLETED,
+                  completedAt: now,
+                },
+                $push: { statusHistory: auditEntry },
+              },
+              updOpts,
+            );
+            await this.availabilityService.releaseBookedSlot(
+              booking._id,
+              session,
+            );
+            return { result: true, bumpVersion: true };
           },
         );
-        await this.availabilityService.releaseBookedSlot(booking._id);
       }
     }
 
@@ -1557,7 +1670,7 @@ export class BookingsService {
     BookingStateMachine.resolveActorRole(viewerId, viewerRole, booking);
 
     const [hydratedList, handovers, reviews, disputes] = await Promise.all([
-      this.hydrateBookings([booking], viewerId),
+      this.hydrateBookings([booking], viewerId, viewerRole),
       this.handoverModel
         .find({ bookingId: booking._id })
         .sort({ createdAt: 1 })
@@ -1572,6 +1685,7 @@ export class BookingsService {
         .lean(),
     ]);
 
+    const isAdminViewer = viewerRole === UserRole.ADMIN;
     const base = hydratedList[0];
     return {
       ...base,
@@ -1595,24 +1709,31 @@ export class BookingsService {
         comment: r.comment,
         createdAt: r.createdAt,
       })),
-      disputes: disputes.map((d: any) => ({
-        id: String(d._id),
-        reporterId: String(d.reporterId),
-        reportedUserId: String(d.reportedUserId),
-        reason: d.reason,
-        description: d.description,
-        evidence: d.evidence || [],
-        status: d.status,
-        adminNotes: d.adminNotes || '',
-        resolvedAt: d.resolvedAt,
-        createdAt: d.createdAt,
-      })),
+      disputes: disputes.map((d: any) => {
+        const isResolved =
+          d.status === DisputeStatus.RESOLVED_FOR_OWNER ||
+          d.status === DisputeStatus.RESOLVED_FOR_RENTER ||
+          d.status === DisputeStatus.CLOSED;
+        return {
+          id: String(d._id),
+          reporterId: String(d.reporterId),
+          reportedUserId: String(d.reportedUserId),
+          reason: d.reason,
+          description: d.description,
+          evidence: d.evidence || [],
+          status: d.status,
+          adminNotes: isAdminViewer || isResolved ? d.adminNotes || '' : '',
+          resolvedAt: d.resolvedAt,
+          createdAt: d.createdAt,
+        };
+      }),
     };
   }
 
   private async hydrateBookings(
     bookings: any[],
     viewerId?: string,
+    viewerRole?: string,
   ): Promise<Record<string, any>[]> {
     if (bookings.length === 0) return [];
 
@@ -1662,6 +1783,10 @@ export class BookingsService {
       const gear = gearMap.get(String(b.gearId));
       const snap = b.pickupLocationSnapshot || {};
 
+      const canSeeOwnerInternalNote =
+        viewerRole === UserRole.ADMIN ||
+        Boolean(viewerId && String(b.ownerId) === String(viewerId));
+
       return {
         id: String(b._id),
         gearId: String(b.gearId),
@@ -1690,6 +1815,9 @@ export class BookingsService {
         },
         renterNote: b.renterNote || '',
         ownerResponseNote: b.ownerResponseNote || '',
+        ...(canSeeOwnerInternalNote
+          ? { ownerInternalNote: b.ownerInternalNote || '' }
+          : {}),
         cancellationReason: b.cancellationReason || '',
         cancelledBy: b.cancelledBy ? String(b.cancelledBy) : undefined,
         approvedAt: b.approvedAt,

@@ -35,7 +35,9 @@ import {
   UpdatePostDto,
 } from './dto/post.dto';
 import {
+  ActivityType,
   CommunityRole,
+  normalizeLegacyActivity,
   ReactionType,
   UserRole,
 } from '../../common/enums/system.enums';
@@ -320,7 +322,11 @@ export class PostsService {
 
     // 4. Activity Type Filter
     if (query.activityType) {
-      andConditions.push({ activityType: query.activityType });
+      andConditions.push(
+        query.activityType === ActivityType.CAMPING
+          ? { activityType: { $in: [ActivityType.CAMPING, 'BEACH_CAMPING'] } }
+          : { activityType: query.activityType },
+      );
     }
 
     // 5. Keyword Search Filter
@@ -826,7 +832,8 @@ export class PostsService {
         mediaUrls: p.mediaUrls || [],
         hashtags: p.hashtags || [],
         locationName: p.locationName || null,
-        activityType: p.activityType || null,
+        activityType:
+          normalizeLegacyActivity(p.activityType).activity || null,
         gearTags: postGear,
         likesCount: p.likesCount || 0,
         commentsCount: p.commentsCount || 0,

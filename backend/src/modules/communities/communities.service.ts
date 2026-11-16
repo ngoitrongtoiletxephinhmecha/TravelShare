@@ -24,6 +24,7 @@ import {
 import {
   ActivityType,
   CommunityRole,
+  normalizeLegacyActivity,
   UserRole,
 } from '../../common/enums/system.enums';
 import {
@@ -158,7 +159,9 @@ export class CommunitiesService {
         description: c.description,
         coverUrl: c.coverUrl || '',
         avatarUrl: c.avatarUrl || c.coverUrl || '',
-        activityType: c.activityType || ActivityType.TREKKING,
+        activityType:
+          normalizeLegacyActivity(c.activityType).activity ||
+          ActivityType.TREKKING,
         rules: c.rules || [],
         ownerId: String(c.ownerId),
         membersCount: c.membersCount ?? 0,
@@ -221,7 +224,9 @@ export class CommunitiesService {
       description: community.description,
       coverUrl: community.coverUrl || '',
       avatarUrl: community.avatarUrl || community.coverUrl || '',
-      activityType: community.activityType || ActivityType.TREKKING,
+      activityType:
+        normalizeLegacyActivity(community.activityType).activity ||
+        ActivityType.TREKKING,
       rules: community.rules || [],
       ownerId: String(community.ownerId),
       membersCount: community.membersCount ?? 0,

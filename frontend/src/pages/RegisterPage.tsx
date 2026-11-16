@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
@@ -37,6 +37,14 @@ export const RegisterPage: React.FC = () => {
   const navigate = useNavigate();
   const setAuth = useAuthStore((s) => s.setAuth);
   const [serverError, setServerError] = useState<string | null>(null);
+  const [googleConfigured, setGoogleConfigured] = useState<boolean>(true);
+
+  useEffect(() => {
+    authService
+      .getGoogleOAuthStatus()
+      .then((res) => setGoogleConfigured(Boolean(res.configured)))
+      .catch(() => setGoogleConfigured(false));
+  }, []);
 
   const {
     register,
@@ -56,7 +64,7 @@ export const RegisterPage: React.FC = () => {
         ...(values.username ? { username: values.username } : {}),
       };
       const res = await authService.register(payload);
-      setAuth(res.user, res.accessToken, res.refreshToken);
+      setAuth(res.user, res.accessToken, res.csrfToken || null);
       navigate('/feed');
     } catch (err: any) {
       const msg =
@@ -179,6 +187,46 @@ export const RegisterPage: React.FC = () => {
             Đăng ký tài khoản
           </Button>
         </form>
+
+        {googleConfigured && (
+          <div className="mt-4">
+            <div className="relative my-4 flex items-center">
+              <div className="flex-grow border-t border-stone-200" />
+              <span className="mx-3 text-[11px] font-medium text-stone-400 uppercase">
+                Hoặc
+              </span>
+              <div className="flex-grow border-t border-stone-200" />
+            </div>
+
+            <button
+              type="button"
+              onClick={() => {
+                window.location.href = authService.getGoogleLoginUrl('/feed');
+              }}
+              className="w-full flex items-center justify-center gap-2.5 px-4 py-2.5 rounded-xl border border-stone-300 bg-white hover:bg-stone-50 text-sm font-semibold text-stone-800 transition-colors shadow-xs"
+            >
+              <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  fill="#EA4335"
+                  d="M12 10.2v3.9h5.5c-.2 1.2-1.4 3.6-5.5 3.6-3.3 0-6-2.7-6-6s2.7-6 6-6c1.9 0 3.1.8 3.8 1.5l2.6-2.5C16.8 3.2 14.6 2.3 12 2.3 6.6 2.3 2.3 6.6 2.3 12s4.3 9.7 9.7 9.7c5.6 0 9.3-3.9 9.3-9.5 0-.6-.1-1.1-.2-1.6H12z"
+                />
+                <path
+                  fill="#34A853"
+                  d="M3.4 7.3l3.2 2.3C7.5 7.4 9.6 5.9 12 5.9c1.9 0 3.1.8 3.8 1.5l2.6-2.5C16.8 3.2 14.6 2.3 12 2.3 8.2 2.3 4.9 4.4 3.4 7.3z"
+                />
+                <path
+                  fill="#FBBC05"
+                  d="M12 21.7c2.6 0 4.8-.9 6.4-2.4l-3-2.5c-.8.6-1.9 1-3.4 1-2.6 0-4.8-1.7-5.6-4.1l-3.2 2.5C4.8 19.4 8.1 21.7 12 21.7z"
+                />
+                <path
+                  fill="#4285F4"
+                  d="M21.3 12.2c0-.6-.1-1.1-.2-1.6H12v3.9h5.5c-.3 1.4-1.1 2.4-2.1 3.1l3 2.5c1.8-1.6 2.9-4.1 2.9-7.9z"
+                />
+              </svg>
+              Đăng ký nhanh với Google
+            </button>
+          </div>
+        )}
 
         <div className="mt-6 pt-5 border-t border-stone-100 text-center text-xs text-stone-600">
           Đã có tài khoản?{' '}

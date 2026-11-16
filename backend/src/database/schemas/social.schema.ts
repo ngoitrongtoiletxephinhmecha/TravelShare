@@ -163,11 +163,33 @@ export class MediaAsset {
   @Prop({ required: true, enum: ['local', 'cloudinary'], default: 'local' })
   storageDriver: 'local' | 'cloudinary';
 
+  @Prop({
+    required: true,
+    enum: ['PUBLIC', 'BOOKING_PARTICIPANTS'],
+    default: 'PUBLIC',
+    index: true,
+  })
+  visibility: 'PUBLIC' | 'BOOKING_PARTICIPANTS';
+
+  @Prop({
+    required: true,
+    enum: ['GENERAL', 'BOOKING_HANDOVER', 'BOOKING_DISPUTE'],
+    default: 'GENERAL',
+    index: true,
+  })
+  scope: 'GENERAL' | 'BOOKING_HANDOVER' | 'BOOKING_DISPUTE';
+
+  @Prop({ type: Types.ObjectId, ref: 'Booking', index: true })
+  bookingId?: Types.ObjectId;
+
   @Prop({ required: true })
   url: string;
 
   @Prop()
   publicId?: string;
+
+  @Prop()
+  storageKey?: string;
 }
 
 export const MediaAssetSchema = SchemaFactory.createForClass(MediaAsset);

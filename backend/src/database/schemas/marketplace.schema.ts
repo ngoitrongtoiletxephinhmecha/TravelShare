@@ -332,6 +332,9 @@ export class Booking {
   ownerResponseNote?: string;
 
   @Prop({ maxlength: 1000 })
+  ownerInternalNote?: string;
+
+  @Prop({ maxlength: 1000 })
   cancellationReason?: string;
 
   @Prop({ type: Types.ObjectId, ref: 'User' })

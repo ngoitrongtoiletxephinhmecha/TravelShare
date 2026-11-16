@@ -11,6 +11,7 @@ import {
   normalizeConversation,
 } from './chat.service';
 import { normalizeNotification } from './notification.service';
+import { refreshSessionSingleFlight } from './api';
 
 const apiBaseUrl =
   import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000/api/v1';
@@ -27,6 +28,7 @@ type MessageListener = (message: ChatMessageItem) => void;
 type ReadReceiptListener = (receipt: ReadReceiptEventPayload) => void;
 type NotificationListener = (notification: NotificationItem) => void;
 type ReconnectListener = () => void;
+type AuthErrorListener = (err: { code?: string; message?: string }) => void;
 
 class SocketRealtimeManager {
   private socket: Socket | null = null;
@@ -37,13 +39,16 @@ class SocketRealtimeManager {
   private readReceiptListeners = new Set<ReadReceiptListener>();
   private notificationListeners = new Set<NotificationListener>();
   private reconnectListeners = new Set<ReconnectListener>();
+  private authErrorListeners = new Set<AuthErrorListener>();
 
   connect(): Socket | null {
     const token = useAuthStore.getState().accessToken;
     const isAuthenticated = useAuthStore.getState().isAuthenticated;
 
     if (!isAuthenticated || !token) {
-      this.disconnect();
+      if (!isAuthenticated) {
+        this.disconnect();
+      }
       return null;
     }
 
@@ -55,6 +60,7 @@ class SocketRealtimeManager {
     }
 
     if (this.socket) {
+      this.socket.removeAllListeners();
       this.socket.disconnect();
       this.socket = null;
     }
@@ -83,6 +89,35 @@ class SocketRealtimeManager {
         });
       }
       this.hadConnectedOnce = true;
+    });
+
+    socket.on('auth:error', async (errPayload: any) => {
+      const code = String(errPayload?.code || '');
+      if (code === 'SESSION_EXPIRED') {
+        try {
+          await refreshSessionSingleFlight();
+          this.connect();
+          return;
+        } catch {
+          // fall through to authErrorListeners + disconnect
+        }
+      }
+
+      if (code === 'ACCOUNT_LOCKED' || code === 'SESSION_REVOKED') {
+        useAuthStore.getState().clearAuth();
+        this.disconnect();
+      }
+
+      this.authErrorListeners.forEach((cb) => {
+        try {
+          cb({
+            code,
+            message: errPayload?.message,
+          });
+        } catch {
+          // ignore
+        }
+      });
     });
 
     socket.on('message:new', (rawMsg: any) => {
@@ -161,11 +196,6 @@ class SocketRealtimeManager {
     });
   }
 
-  /**
-   * Send message via Socket.IO `message:send` with durable MongoDB ACK.
-   * Falls back to REST `/chats/conversations/:id/messages` with the SAME `clientMessageId`
-   * if the socket is temporarily offline, guaranteeing idempotency without duplicate messages.
-   */
   async sendMessage(params: {
     conversationId: string;
     content: string;
@@ -182,7 +212,6 @@ class SocketRealtimeManager {
     if (socket && socket.connected) {
       return new Promise((resolve, reject) => {
         const timeoutId = setTimeout(async () => {
-          // Fallback to REST with the exact same clientMessageId
           try {
             const restRes = await chatService.sendMessageRest(
               params.conversationId,
@@ -216,7 +245,6 @@ class SocketRealtimeManager {
       });
     }
 
-    // If socket is not currently connected, send over REST with the same clientMessageId
     return chatService.sendMessageRest(params.conversationId, {
       content: params.content,
       clientMessageId: params.clientMessageId,
@@ -265,6 +293,13 @@ class SocketRealtimeManager {
     this.reconnectListeners.add(listener);
     return () => {
       this.reconnectListeners.delete(listener);
+    };
+  }
+
+  onAuthError(listener: AuthErrorListener): () => void {
+    this.authErrorListeners.add(listener);
+    return () => {
+      this.authErrorListeners.delete(listener);
     };
   }
 }

@@ -179,8 +179,14 @@ export class GearController {
   async getAvailability(
     @Param('id') id: string,
     @Query() query: CheckAvailabilityQueryDto,
+    @CurrentUser() user?: RequestUser | null,
   ) {
-    return this.availabilityService.getGearAvailability(id, query);
+    return this.availabilityService.getGearAvailability(
+      id,
+      query,
+      user?.userId,
+      user?.role,
+    );
   }
 
   @Post(':id/unavailable-periods')

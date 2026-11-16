@@ -6,7 +6,8 @@ export type ActivityType =
   | 'MOTORBIKE_TOUR'
   | 'BACKPACKING'
   | 'MOUNTAINEERING'
-  | 'BEACH_CAMPING'
+  | 'BEACH'
+  | 'SIGHTSEEING'
   | 'OTHER';
 
 export type GearCondition = 'NEW' | 'LIKE_NEW' | 'GOOD' | 'FAIR';
@@ -178,7 +179,8 @@ export interface AuthUser {
 export interface AuthResponse {
   user: AuthUser;
   accessToken: string;
-  refreshToken: string;
+  refreshToken?: string;
+  csrfToken?: string;
   expiresIn: number;
 }
 
@@ -571,6 +573,10 @@ export interface ValidatedTripState {
   destination: string | null;
   route: string | null;
   activity: string | null;
+  environment?: 'COASTAL' | 'MOUNTAIN' | 'FOREST' | 'URBAN' | string | null;
+  isOvernight?: boolean | null;
+  secondaryActivities?: string[];
+  savedSpots?: string[];
   departureDate: string | null;
   endDate: string | null;
   durationDays: number | null;

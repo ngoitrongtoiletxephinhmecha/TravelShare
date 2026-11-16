@@ -135,4 +135,11 @@ export class MatchChecklistGearDto {
   @Type(() => Number)
   @IsInt()
   expectedChecklistVersion?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(50)
+  limitPerItem?: number;
 }

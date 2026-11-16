@@ -18,13 +18,14 @@ import { isVideoUrl } from './MediaGallery';
 import { formatVnd } from '../../utils/format';
 
 const ACTIVITY_OPTIONS: { value: ActivityType; label: string }[] = [
-  { value: 'TREKKING', label: 'Trekking / Leo núi' },
+  { value: 'TREKKING', label: 'Trekking / Đi bộ đường dài' },
   { value: 'CAMPING', label: 'Camping / Cắm trại' },
   { value: 'MOTORBIKE_TOUR', label: 'Phượt xe máy' },
   { value: 'BACKPACKING', label: 'Du lịch bụi (Backpacking)' },
-  { value: 'MOUNTAINEERING', label: 'Chinh phục đỉnh cao' },
-  { value: 'BEACH_CAMPING', label: 'Cắm trại biển' },
-  { value: 'OTHER', label: 'Hoạt động ngoài trời khác' },
+  { value: 'MOUNTAINEERING', label: 'Leo núi kỹ thuật' },
+  { value: 'BEACH', label: 'Đi biển' },
+  { value: 'SIGHTSEEING', label: 'Tham quan / Khám phá' },
+  { value: 'OTHER', label: 'Hoạt động khác' },
 ];
 
 export const CreatePostModal: React.FC<{

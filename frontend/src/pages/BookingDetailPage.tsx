@@ -33,6 +33,7 @@ import {
   ReturnConfirmation,
   ReviewModal,
 } from '../components/booking/BookingModals';
+import { AuthorizedMediaImage } from '../components/booking/AuthorizedMediaImage';
 import { formatVietnamDateTime } from '../utils/format';
 
 export const BookingDetailPage: React.FC = () => {
@@ -488,6 +489,23 @@ export const BookingDetailPage: React.FC = () => {
                 <Badge variant="red">{d.status}</Badge>
               </div>
               <p className="text-stone-800">{d.description}</p>
+              {d.evidence && d.evidence.length > 0 && (
+                <div>
+                  <p className="text-[11px] font-semibold text-stone-600 mb-1.5">
+                    Bằng chứng đính kèm ({d.evidence.length}):
+                  </p>
+                  <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
+                    {d.evidence.map((url, idx) => (
+                      <AuthorizedMediaImage
+                        key={`${url}-${idx}`}
+                        src={url}
+                        alt="Dispute evidence"
+                        className="w-full h-24 object-cover rounded-xl border border-stone-200"
+                      />
+                    ))}
+                  </div>
+                </div>
+              )}
               {d.adminNotes && (
                 <p className="p-2 rounded-lg bg-emerald-50 text-emerald-900 font-medium">
                   Quyết định của Admin: {d.adminNotes}

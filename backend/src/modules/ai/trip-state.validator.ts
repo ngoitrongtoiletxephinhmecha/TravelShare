@@ -3,6 +3,7 @@ import {
   ActivityType,
   ChecklistPriority,
   ExperienceLevel,
+  normalizeLegacyActivity,
 } from '../../common/enums/system.enums';
 import {
   AiConversationStatus,
@@ -18,27 +19,63 @@ export interface TripValidationResult {
   nextQuestion: string | null;
 }
 
-const ACTIVITY_LABELS_VI: Record<ActivityType, string> = {
-  [ActivityType.TREKKING]: 'Trekking / Leo núi',
+export const ACTIVITY_LABELS_VI: Record<ActivityType, string> = {
+  [ActivityType.TREKKING]: 'Trekking / Đi bộ đường dài',
   [ActivityType.CAMPING]: 'Cắm trại (Camping)',
   [ActivityType.MOTORBIKE_TOUR]: 'Phượt xe máy',
   [ActivityType.BACKPACKING]: 'Du lịch bụi (Backpacking)',
-  [ActivityType.MOUNTAINEERING]: 'Chinh phục đỉnh cao (Mountaineering)',
-  [ActivityType.BEACH_CAMPING]: 'Cắm trại biển',
-  [ActivityType.OTHER]: 'Dã ngoại ngoài trời',
+  [ActivityType.MOUNTAINEERING]: 'Leo núi kỹ thuật (Mountaineering)',
+  [ActivityType.BEACH]: 'Đi biển',
+  [ActivityType.SIGHTSEEING]: 'Tham quan / Khám phá',
+  [ActivityType.OTHER]: 'Hoạt động khác',
 };
+
+export function formatActivitySummaryVi(state: {
+  activity?: ActivityType | null;
+  environment?: string | null;
+  isOvernight?: boolean | null;
+}): string {
+  if (!state.activity) return 'Chưa chọn hoạt động';
+  let label =
+    state.activity === ActivityType.CAMPING && state.environment === 'COASTAL'
+      ? 'Cắm trại biển'
+      : ACTIVITY_LABELS_VI[state.activity] || String(state.activity);
+  if (state.isOvernight) {
+    label += ' (qua đêm)';
+  }
+  return label;
+}
 
 const GEAR_CODE_LABELS_VI: Record<string, string> = {
   TENT: 'Lều trại',
-  BACKPACK: 'Balo trekking',
+  BACKPACK: 'Balo',
   SLEEPING_BAG: 'Túi ngủ',
   TREKKING_SHOES: 'Giày trekking',
   TREKKING_POLES: 'Gậy trekking',
-  RAIN_JACKET: 'Áo khoác chống nước / Áo mưa',
+  RAIN_JACKET: 'Áo khoác / Áo mưa',
   HEADLAMP: 'Đèn đội đầu / Đèn pin',
   CAMPING_STOVE: 'Bếp dã ngoại',
-  CAMPING_CHAIR: 'Bàn ghế camping',
-  CAMERA: 'Máy ảnh hành trình',
+  CAMPING_CHAIR: 'Ghế xếp camping',
+  TARP: 'Tấm bạt / Tăng che',
+  CAMERA: 'Máy ảnh / Action Cam',
+  SWIMWEAR: 'Đồ bơi cá nhân',
+  BEACH_TOWEL: 'Khăn tắm',
+  BEACH_SANDALS: 'Dép đi biển',
+  SUN_PROTECTION: 'Kem chống nắng & kính râm',
+  DRY_BAG: 'Túi khô chống nước',
+  WALKING_SHOES: 'Giày đi bộ',
+  POWER_BANK: 'Pin sạc dự phòng',
+  HELMET: 'Mũ bảo hiểm',
+  RIDING_GLOVES_ARMOR: 'Găng tay & giáp bảo hộ',
+  BUNGEE_CORDS: 'Dây ràng hành lý',
+  TIRE_REPAIR_KIT: 'Bộ vá xe cơ bản',
+  TRAVEL_LOCK_POUCH: 'Túi giấy tờ & khóa nhỏ',
+  QUICK_DRY_CLOTHES: 'Quần áo nhanh khô',
+  FIRST_AID_KIT: 'Túi y tế / sơ cứu',
+  THERMAL_LAYER: 'Áo giữ nhiệt / lông vũ',
+  CLIMBING_GLOVES: 'Găng tay leo núi',
+  WATER_ELECTROLYTE: 'Nước uống & điện giải',
+  TRAIL_FOOD: 'Đồ ăn năng lượng',
 };
 
 @Injectable()
@@ -49,6 +86,10 @@ export class TripStateValidator {
       destination: null,
       route: null,
       activity: null,
+      environment: null,
+      isOvernight: null,
+      secondaryActivities: [],
+      savedSpots: [],
       departureDate: null,
       endDate: null,
       durationDays: null,
@@ -72,11 +113,25 @@ export class TripStateValidator {
     if (!raw || typeof raw !== 'object') {
       return base;
     }
+    const normAct = normalizeLegacyActivity(
+      raw.activity as string | null | undefined,
+      raw.environment,
+    );
     return {
       intent: raw.intent ?? null,
       destination: raw.destination ?? null,
       route: raw.route ?? null,
-      activity: raw.activity ?? null,
+      activity: normAct.activity,
+      environment: normAct.environment,
+      isOvernight: typeof raw.isOvernight === 'boolean' ? raw.isOvernight : null,
+      secondaryActivities: Array.isArray(raw.secondaryActivities)
+        ? raw.secondaryActivities
+            .map((a) => normalizeLegacyActivity(String(a)).activity)
+            .filter((a): a is ActivityType => Boolean(a))
+        : [],
+      savedSpots: Array.isArray(raw.savedSpots)
+        ? raw.savedSpots.map((s) => String(s)).filter(Boolean)
+        : [],
       departureDate: raw.departureDate ?? null,
       endDate: raw.endDate ?? null,
       durationDays:
@@ -159,7 +214,35 @@ export class TripStateValidator {
     if (u.intent !== undefined) next.intent = u.intent;
     if (u.destination !== undefined) next.destination = u.destination;
     if (u.route !== undefined) next.route = u.route;
-    if (u.activity !== undefined) next.activity = u.activity;
+    if (u.activity !== undefined) {
+      const norm = normalizeLegacyActivity(
+        u.activity,
+        u.environment ?? undefined,
+      );
+      next.activity = norm.activity;
+      if (norm.environment !== null) {
+        next.environment = norm.environment;
+      } else if (
+        norm.activity !== ActivityType.CAMPING &&
+        norm.activity !== ActivityType.BEACH &&
+        next.environment === 'COASTAL' &&
+        u.environment === undefined
+      ) {
+        next.environment = null;
+      }
+    }
+    if (u.environment !== undefined) next.environment = u.environment;
+    if (u.isOvernight !== undefined) next.isOvernight = u.isOvernight;
+    if (Array.isArray(u.secondaryActivities)) {
+      next.secondaryActivities = Array.from(
+        new Set([...(next.secondaryActivities || []), ...u.secondaryActivities]),
+      );
+    }
+    if (Array.isArray(u.savedSpots)) {
+      next.savedSpots = Array.from(
+        new Set([...(next.savedSpots || []), ...u.savedSpots]),
+      );
+    }
     if (u.departureDate !== undefined) next.departureDate = u.departureDate;
     if (u.durationDays !== undefined) next.durationDays = u.durationDays;
     if (u.travelers !== undefined) next.travelers = u.travelers;
@@ -278,21 +361,37 @@ export class TripStateValidator {
       nextQuestion = ambiguousDateNote;
     } else if (missingFields.includes('destination') && missingFields.includes('activity')) {
       nextQuestion =
-        'Bạn dự định đi địa điểm nào và tham gia hoạt động gì (ví dụ: cắm trại Ba Vì, trekking Yên Tử hay tham quan)?';
+        'Bạn dự định đi địa điểm nào và tham gia hoạt động gì (ví dụ: đi biển, cắm trại, tham quan, trekking hay phượt xe máy)?';
     } else if (missingFields.includes('destination')) {
       nextQuestion =
         'Bạn dự định đi địa điểm nào để mình tư vấn phù hợp nhé?';
     } else if (missingFields.includes('activity')) {
-      nextQuestion = `Tại **${state.destination}**, bạn dự định đi **tham quan**, **trekking leo núi** hay **cắm trại**?`;
+      nextQuestion = `Tại **${state.destination}**, bạn dự định **đi biển**, **cắm trại**, **tham quan** hay **trekking / leo núi**?`;
     } else if (
       missingFields.includes('durationDays') &&
       missingFields.includes('travelers')
     ) {
-      nextQuestion = `Chuyến đi **${state.destination}** của bạn dự kiến kéo dài **mấy ngày** và đoàn gồm **bao nhiêu người** ạ?`;
+      nextQuestion = `Chuyến đi **${state.destination}** (${formatActivitySummaryVi(state)}) của bạn dự kiến kéo dài **mấy ngày** và đoàn gồm **bao nhiêu người** ạ?`;
     } else if (missingFields.includes('durationDays')) {
       nextQuestion = `Nhóm ${state.travelers} người của bạn dự kiến đi **${state.destination}** trong **mấy ngày** (ví dụ: đi về trong 1 ngày hay 2 ngày 1 đêm)?`;
     } else if (missingFields.includes('travelers')) {
       nextQuestion = `Chuyến đi **${state.destination}** (${state.durationDays} ngày) của bạn có **bao nhiêu thành viên** tham gia để mình tính đúng số lượng thiết bị cần chuẩn bị?`;
+    } else if (
+      state.activity === ActivityType.MOUNTAINEERING &&
+      !state.experienceLevel &&
+      !state.route
+    ) {
+      recommendedOptionalFields.push('route', 'experienceLevel');
+      nextQuestion =
+        'Với **leo núi kỹ thuật (Mountaineering)**, bạn định đi cung/đỉnh nào và nhóm đã có kinh nghiệm hay thiết bị chuyên dụng gì chưa để mình điều chỉnh checklist sát hơn?';
+    } else if (
+      state.activity === ActivityType.OTHER &&
+      !state.notes &&
+      !state.route
+    ) {
+      recommendedOptionalFields.push('notes');
+      nextQuestion =
+        'Hoạt động cụ thể của nhóm (ví dụ: chèo SUP, câu cá, team building...) là gì để mình bổ sung đúng vật dụng cần thiết?';
     } else if (
       state.wantsToRent &&
       (!state.departureDate || !state.pickupArea)
@@ -333,6 +432,9 @@ export class TripStateValidator {
     checklistMutationSummaries?: string[];
     checklistClarifications?: string[];
     checklistReadReplies?: string[];
+    savedSpotsReply?: string | null;
+    missingItemsReply?: string | null;
+    rentalMatchReply?: string | null;
     checklistJustCreated?: boolean;
     shouldPrintFullChecklist?: boolean;
     userMessage?: string;
@@ -347,6 +449,9 @@ export class TripStateValidator {
       checklistMutationSummaries = [],
       checklistClarifications = [],
       checklistReadReplies = [],
+      savedSpotsReply = null,
+      missingItemsReply = null,
+      rentalMatchReply = null,
       checklistJustCreated = false,
       shouldPrintFullChecklist = false,
       userMessage = '',
@@ -354,7 +459,15 @@ export class TripStateValidator {
     } = params;
     const lines: string[] = [];
 
-    if (patch.providerFailureNote && !patch.generalAnswer && !patch.destinationAnswer && !patch.itineraryAnswer) {
+    if (
+      patch.providerFailureNote &&
+      !patch.generalAnswer &&
+      !patch.destinationAnswer &&
+      !patch.itineraryAnswer &&
+      !savedSpotsReply &&
+      !missingItemsReply &&
+      !rentalMatchReply
+    ) {
       return patch.providerFailureNote;
     }
 
@@ -374,15 +487,19 @@ export class TripStateValidator {
     ) {
       changes.push(
         nextState.activity
-          ? `địa điểm **${nextState.destination}** (${ACTIVITY_LABELS_VI[nextState.activity]})`
+          ? `địa điểm **${nextState.destination}** (${formatActivitySummaryVi(nextState)})`
           : `địa điểm **${nextState.destination}**`,
       );
     } else if (
-      patch.updatedFields.activity &&
-      patch.updatedFields.activity !== prevState.activity
+      (patch.updatedFields.activity &&
+        patch.updatedFields.activity !== prevState.activity) ||
+      (patch.updatedFields.environment &&
+        patch.updatedFields.environment !== prevState.environment) ||
+      (patch.updatedFields.isOvernight !== undefined &&
+        patch.updatedFields.isOvernight !== prevState.isOvernight)
     ) {
       changes.push(
-        `hoạt động **${ACTIVITY_LABELS_VI[nextState.activity!]}**`,
+        `hoạt động **${formatActivitySummaryVi(nextState)}**`,
       );
     }
 
@@ -462,6 +579,9 @@ export class TripStateValidator {
     const hasGeneralQa = Boolean(patch.generalAnswer);
     const hasItineraryAdvice = Boolean(patch.itineraryAnswer);
     const hasReadReplies = checklistReadReplies.length > 0;
+    const hasStructuredChatReplies = Boolean(
+      savedSpotsReply || missingItemsReply || rentalMatchReply,
+    );
     const isSmallTalkOnly = Boolean(
       patch.turnActions?.includes('SMALL_TALK') &&
         changes.length === 0 &&
@@ -469,7 +589,8 @@ export class TripStateValidator {
         !hasDestinationQa &&
         !hasGeneralQa &&
         !hasItineraryAdvice &&
-        !hasReadReplies,
+        !hasReadReplies &&
+        !hasStructuredChatReplies,
     );
     const isPureChecklistView = Boolean(
       patch.requestChecklistPrint &&
@@ -478,7 +599,8 @@ export class TripStateValidator {
         !hasDestinationQa &&
         !hasGeneralQa &&
         !hasItineraryAdvice &&
-        !hasReadReplies,
+        !hasReadReplies &&
+        !hasStructuredChatReplies,
     );
 
     if (isSmallTalkOnly) {
@@ -500,6 +622,18 @@ export class TripStateValidator {
       lines.push(patch.itineraryAnswer);
     }
 
+    if (savedSpotsReply) {
+      lines.push(savedSpotsReply);
+    }
+
+    if (missingItemsReply) {
+      lines.push(missingItemsReply);
+    }
+
+    if (rentalMatchReply) {
+      lines.push(rentalMatchReply);
+    }
+
     if (hasReadReplies) {
       lines.push(checklistReadReplies.map((r) => `📦 ${r}`).join('\n'));
     }
@@ -518,6 +652,7 @@ export class TripStateValidator {
       !hasGeneralQa &&
       !hasItineraryAdvice &&
       !hasReadReplies &&
+      !hasStructuredChatReplies &&
       !isPureChecklistView &&
       !checklistJustCreated &&
       checklistClarifications.length === 0
@@ -584,7 +719,8 @@ export class TripStateValidator {
       (hasDestinationQa ||
         hasGeneralQa ||
         hasItineraryAdvice ||
-        hasReadReplies) &&
+        hasReadReplies ||
+        hasStructuredChatReplies) &&
       changes.length === 0 &&
       checklistMutationSummaries.length === 0 &&
       !checklistJustCreated &&
@@ -612,11 +748,7 @@ export class TripStateValidator {
         (checklistJustCreated || changes.length > 0)
       ) {
         lines.push(
-          `✅ **Kế hoạch chuyến đi đã đủ thông tin (READY_FOR_CHECKLIST)!** (${nextState.destination || 'Chuyến đi'} • ${
-            nextState.activity
-              ? ACTIVITY_LABELS_VI[nextState.activity]
-              : 'Chưa chọn hoạt động'
-          } • ${nextState.durationDays} ngày • ${nextState.travelers} người).${
+          `✅ **Kế hoạch chuyến đi đã đủ thông tin (READY_FOR_CHECKLIST)!** (${nextState.destination || 'Chuyến đi'} • ${formatActivitySummaryVi(nextState)} • ${nextState.durationDays} ngày • ${nextState.travelers} người).${
             !checklistJustCreated && !checklistExists
               ? ' Bạn có thể bấm nút **Tạo checklist** trên màn hình hoặc nhắn *"Tạo checklist"* bất cứ lúc nào.'
               : ''

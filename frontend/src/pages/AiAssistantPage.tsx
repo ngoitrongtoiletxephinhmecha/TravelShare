@@ -54,13 +54,15 @@ function generateAiClientMessageId(): string {
 }
 
 const ACTIVITY_LABELS: Record<string, string> = {
-  TREKKING: 'Trekking / Leo núi',
+  TREKKING: 'Trekking / Đi bộ đường dài',
   CAMPING: 'Cắm trại (Camping)',
   MOTORBIKE_TOUR: 'Phượt xe máy',
   BACKPACKING: 'Du lịch bụi (Backpacking)',
-  MOUNTAINEERING: 'Leo núi mạo hiểm',
+  MOUNTAINEERING: 'Leo núi kỹ thuật (Mountaineering)',
+  BEACH: 'Đi biển',
+  SIGHTSEEING: 'Tham quan / Khám phá',
   BEACH_CAMPING: 'Cắm trại biển',
-  OTHER: 'Dã ngoại ngoài trời',
+  OTHER: 'Hoạt động khác',
 };
 
 const EXPERIENCE_LABELS: Record<string, string> = {
@@ -164,6 +166,9 @@ export const AiAssistantPage: React.FC = () => {
   const [isMatchStale, setIsMatchStale] = useState(false);
 
   const latestChecklistVersionRef = useRef<number>(0);
+  const latestChecklistIdRef = useRef<string | null>(null);
+  const matchRequestSeqRef = useRef<number>(0);
+  const latestMatchFilterSigRef = useRef<string>('');
   const skipNextConvLoadRef = useRef<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const checklistSectionRef = useRef<HTMLDivElement | null>(null);
@@ -637,6 +642,10 @@ export const AiAssistantPage: React.FC = () => {
     }
   };
 
+  const currentMatchFilterSig = `${matchStartAt}|${matchEndAt}|${matchPickupArea.trim()}|${matchBudgetInput.trim()}|${matchSharingType}`;
+  latestMatchFilterSigRef.current = currentMatchFilterSig;
+  latestChecklistIdRef.current = activeChecklist?.id || null;
+
   const handleMatchMissingGear = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!activeChecklist) return;
@@ -650,7 +659,10 @@ export const AiAssistantPage: React.FC = () => {
 
     setMatchError(null);
     setMatchingGear(true);
+    const reqId = ++matchRequestSeqRef.current;
+    const targetChecklistId = activeChecklist.id;
     const versionAtRequestStart = latestChecklistVersionRef.current;
+    const filterSigAtStart = currentMatchFilterSig;
 
     try {
       let parsedBudget: number | null | undefined = undefined;
@@ -664,7 +676,7 @@ export const AiAssistantPage: React.FC = () => {
         parsedBudget = num;
       }
 
-      const res = await checklistService.matchMissingGear(activeChecklist.id, {
+      const res = await checklistService.matchMissingGear(targetChecklistId, {
         startAt: matchStartAt,
         endAt: matchEndAt,
         pickupArea: matchPickupArea.trim() || undefined,
@@ -673,8 +685,13 @@ export const AiAssistantPage: React.FC = () => {
         expectedChecklistVersion: versionAtRequestStart,
       });
 
-      // Ignore stale response if the user edited the checklist while the request was in flight
-      if (res.checklistVersion < latestChecklistVersionRef.current) {
+      // Discard stale response if user switched checklist, edited checklistVersion, or changed filters while in-flight
+      if (
+        reqId !== matchRequestSeqRef.current ||
+        res.checklistId !== latestChecklistIdRef.current ||
+        Number(res.checklistVersion) !== Number(latestChecklistVersionRef.current) ||
+        filterSigAtStart !== latestMatchFilterSigRef.current
+      ) {
         setIsMatchStale(true);
         return;
       }
@@ -682,6 +699,9 @@ export const AiAssistantPage: React.FC = () => {
       setMatchResult(res);
       setIsMatchStale(false);
     } catch (err: any) {
+      if (reqId !== matchRequestSeqRef.current) {
+        return;
+      }
       const msg =
         err?.response?.data?.error?.message ||
         err?.response?.data?.message ||
@@ -1093,7 +1113,14 @@ export const AiAssistantPage: React.FC = () => {
                 </span>
                 <p className="font-bold text-stone-900 mt-1">
                   {tripState.activity ? (
-                    ACTIVITY_LABELS[tripState.activity] || tripState.activity
+                    <>
+                      {tripState.activity === 'CAMPING' &&
+                      tripState.environment === 'COASTAL'
+                        ? 'Cắm trại biển'
+                        : ACTIVITY_LABELS[tripState.activity] ||
+                          tripState.activity}
+                      {tripState.isOvernight ? ' (qua đêm)' : ''}
+                    </>
                   ) : (
                     <span className="text-stone-400 font-normal italic">
                       Chưa xác định
@@ -1825,6 +1852,99 @@ export const AiAssistantPage: React.FC = () => {
                   </div>
                 </div>
 
+                {/* Unconfirmed Owned Items (must confirm owned count before matching/concluding budget) */}
+                {matchResult.unconfirmedOwnedItems &&
+                  matchResult.unconfirmedOwnedItems.length > 0 && (
+                    <div className="p-4 rounded-2xl bg-amber-50/80 border border-amber-200 space-y-2.5 text-xs">
+                      <p className="font-bold text-amber-950">
+                        Cần bổ sung số lượng đã có ({matchResult.unconfirmedOwnedItems.length} mục)
+                      </p>
+                      <p className="text-amber-800 text-[11px]">
+                        Các thiết bị dưới đây chưa rõ bạn đang có sẵn bao nhiêu nên chưa thể đưa vào phương án thuê. Hãy xác nhận số lượng rồi tìm lại.
+                      </p>
+                      <div className="space-y-2">
+                        {matchResult.unconfirmedOwnedItems.map((u) => (
+                          <div
+                            key={u.itemId}
+                            className="flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-xl bg-white border border-amber-200/80"
+                          >
+                            <div>
+                              <span className="font-semibold text-stone-900">
+                                {u.name}
+                              </span>
+                              <span className="text-stone-500 ml-2">
+                                (Cần: {u.quantityRequired})
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <input
+                                type="number"
+                                min={0}
+                                max={999}
+                                value={ownedDrafts[u.itemId] ?? String(u.quantityOwned ?? 0)}
+                                onChange={(e) =>
+                                  setOwnedDrafts((prev) => ({
+                                    ...prev,
+                                    [u.itemId]: e.target.value,
+                                  }))
+                                }
+                                className="w-16 px-2 py-1 rounded-lg border border-stone-300 text-xs"
+                              />
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="primary"
+                                isLoading={updatingItemId === u.itemId}
+                                onClick={() => {
+                                  const qty = Math.max(
+                                    0,
+                                    Math.floor(
+                                      Number(ownedDrafts[u.itemId] ?? u.quantityOwned ?? 0),
+                                    ) || 0,
+                                  );
+                                  handleSaveItemUpdate(u.itemId, {
+                                    quantityOwned: qty,
+                                    ownedConfirmed: true,
+                                  });
+                                }}
+                              >
+                                Xác nhận số đã có
+                              </Button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                {/* Concrete Allocation Plan Summary */}
+                {matchResult.allocationPlan &&
+                  matchResult.allocationPlan.length > 0 && (
+                    <div className="p-3.5 rounded-2xl bg-emerald-50/50 border border-emerald-200/80 text-xs space-y-2">
+                      <p className="font-bold text-emerald-950">
+                        Phương án phân bổ cụ thể ({matchResult.allocationPlan.length} gợi ý — mỗi đơn vị chỉ tính 1 lần):
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        {matchResult.allocationPlan.map((alloc, idx) => (
+                          <Link
+                            key={`${alloc.itemId}_${alloc.gearId}_${alloc.sizeLabel || 'all'}_${idx}`}
+                            to={alloc.bookingUrl}
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-white border border-emerald-200 text-[11px] font-medium text-stone-800 hover:border-emerald-500"
+                          >
+                            <span>
+                              {alloc.itemName}
+                              {alloc.sizeLabel ? ` (Size ${alloc.sizeLabel})` : ''}:{' '}
+                              <strong>
+                                {alloc.quantityAllocated} {alloc.unit}
+                              </strong>{' '}
+                              — {alloc.title} ({formatVnd(alloc.totalRentalFee)})
+                            </span>
+                          </Link>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                 {/* Grouped Item Matches */}
                 <div className="space-y-4">
                   {matchResult.itemMatches.map((group) => (
@@ -1855,6 +1975,26 @@ export const AiAssistantPage: React.FC = () => {
                               {group.quantityMissing} {group.unit}
                             </strong>
                           </p>
+                          {group.sizeAllocations &&
+                            group.sizeAllocations.some((sa) => sa.sizeLabel) && (
+                              <div className="flex flex-wrap gap-1.5 mt-1.5">
+                                {group.sizeAllocations
+                                  .filter((sa) => sa.sizeLabel)
+                                  .map((sa) => (
+                                    <Badge
+                                      key={sa.sizeLabel!}
+                                      variant={
+                                        sa.qtyFulfilled >= sa.qtyNeeded
+                                          ? 'emerald'
+                                          : 'amber'
+                                      }
+                                    >
+                                      Size {sa.sizeLabel}: {sa.qtyFulfilled}/
+                                      {sa.qtyNeeded}
+                                    </Badge>
+                                  ))}
+                              </div>
+                            )}
                         </div>
 
                         <Badge

@@ -4,7 +4,9 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { InjectModel } from '@nestjs/mongoose';
 import { FilterQuery, Model, Types } from 'mongoose';
 import {
@@ -63,7 +65,17 @@ export class GearService {
     @InjectModel(Booking.name)
     private bookingModel: Model<BookingDocument>,
     private availabilityService: AvailabilityService,
+    @Optional()
+    private readonly configService?: ConfigService,
   ) {}
+
+  private isProductionEnvironment(): boolean {
+    return Boolean(
+      this.configService?.get<boolean>('isProduction') ||
+        this.configService?.get<string>('nodeEnv') === 'production' ||
+        process.env.NODE_ENV === 'production',
+    );
+  }
 
   // ==========================================
   // 1. GEAR CATEGORY MANAGEMENT
@@ -279,6 +291,10 @@ export class GearService {
       throw new NotFoundException('Không tìm thấy thiết bị');
     }
 
+    if (this.isProductionEnvironment() && gear.isDemo) {
+      throw new NotFoundException('Không tìm thấy thiết bị');
+    }
+
     const isOwner = String(gear.ownerId) === String(userId);
     const isAdmin = userRole === UserRole.ADMIN;
     if (!isOwner && !isAdmin) {
@@ -318,7 +334,21 @@ export class GearService {
     if (dto.brand !== undefined) gear.brand = dto.brand.trim();
     if (dto.condition !== undefined) gear.condition = dto.condition;
     if (dto.attributes !== undefined) gear.attributes = dto.attributes;
-    if (dto.totalQuantity !== undefined) gear.totalQuantity = dto.totalQuantity;
+    if (dto.totalQuantity !== undefined) {
+      const nextTotalQty = Math.max(1, Number(dto.totalQuantity) || 1);
+      if (nextTotalQty < (gear.totalQuantity || 1)) {
+        const futurePeak =
+          await this.availabilityService.getMaxFuturePeakReservedQuantity(
+            gear._id as any,
+          );
+        if (nextTotalQty < futurePeak) {
+          throw new ConflictException(
+            `Không thể giảm tổng số lượng xuống ${nextTotalQty} vì hiện có ${futurePeak} chiếc đang được giữ chỗ hoặc khóa lịch`,
+          );
+        }
+      }
+      gear.totalQuantity = nextTotalQty;
+    }
 
     gear.sharingType = nextSharingType;
     gear.listingType = nextSharingType;
@@ -375,6 +405,72 @@ export class GearService {
       gear.status === GearStatus.ACTIVE &&
       gear.moderationStatus === GearModerationStatus.APPROVED;
 
+    if (
+      (dto.totalQuantity !== undefined || dto.status !== undefined) &&
+      typeof this.gearModel.findOneAndUpdate === 'function'
+    ) {
+      const savedObj = await this.availabilityService.runGearReservationTransaction(
+        gearId,
+        async ({ gear: txGear, session }) => {
+          const nextTotalQty =
+            dto.totalQuantity !== undefined
+              ? Math.max(1, Number(dto.totalQuantity) || 1)
+              : Math.max(1, Number(txGear.totalQuantity) || 1);
+
+          if (nextTotalQty < Math.max(1, Number(txGear.totalQuantity) || 1)) {
+            const futurePeak =
+              await this.availabilityService.getMaxFuturePeakReservedQuantity(
+                txGear._id,
+                new Date(),
+                session,
+              );
+            if (nextTotalQty < futurePeak) {
+              throw new ConflictException(
+                `Không thể giảm tổng số lượng xuống ${nextTotalQty} vì hiện có ${futurePeak} chiếc đang được giữ chỗ hoặc khóa lịch`,
+              );
+            }
+          }
+
+          const updatedGearDoc = {
+            categoryCode: gear.categoryCode,
+            categoryId: gear.categoryId,
+            title: gear.title,
+            description: gear.description,
+            brand: gear.brand,
+            condition: gear.condition,
+            attributes: gear.attributes,
+            images: gear.images,
+            totalQuantity: nextTotalQty,
+            sharingType: gear.sharingType,
+            listingType: gear.listingType,
+            pricePerDay: gear.pricePerDay,
+            dailyPriceVnd: gear.dailyPriceVnd,
+            depositAmount: gear.depositAmount,
+            depositAmountVnd: gear.depositAmountVnd,
+            city: gear.city,
+            district: gear.district,
+            pickupLocation: gear.pickupLocation,
+            usageRules: gear.usageRules,
+            availabilitySettings: gear.availabilitySettings,
+            status: gear.status,
+            isActive: gear.isActive,
+          };
+
+          const q = this.gearModel.findById(gearId);
+          if (session && typeof (q as any).session === 'function') {
+            (q as any).session(session);
+          }
+          const latestPlain = await q.lean();
+          return {
+            result: { ...latestPlain, ...updatedGearDoc, _id: gear._id },
+            gearSet: updatedGearDoc,
+          };
+        },
+      );
+      const [enriched] = await this.enrichGearItems([savedObj]);
+      return enriched;
+    }
+
     await gear.save();
     const [enriched] = await this.enrichGearItems([gear.toObject()]);
     return enriched;
@@ -395,6 +491,10 @@ export class GearService {
       throw new NotFoundException('Không tìm thấy thiết bị');
     }
 
+    if (this.isProductionEnvironment() && gear.isDemo) {
+      throw new NotFoundException('Không tìm thấy thiết bị');
+    }
+
     const isOwner = String(gear.ownerId) === String(userId);
     const isAdmin = userRole === UserRole.ADMIN;
     if (!isOwner && !isAdmin) {
@@ -404,6 +504,31 @@ export class GearService {
     }
 
     // Soft-archive check: never hard delete, preserve reference for bookings
+    if (typeof this.gearModel.findOneAndUpdate === 'function') {
+      const updated =
+        await this.availabilityService.runGearReservationTransaction(
+          gearId,
+          async ({ gear: txGear }) => {
+            const nextIsActive =
+              dto.status === GearStatus.ACTIVE &&
+              txGear.moderationStatus === GearModerationStatus.APPROVED;
+            return {
+              result: {
+                ...txGear,
+                status: dto.status,
+                isActive: nextIsActive,
+              },
+              gearSet: {
+                status: dto.status,
+                isActive: nextIsActive,
+              },
+            };
+          },
+        );
+      const [enriched] = await this.enrichGearItems([updated]);
+      return enriched;
+    }
+
     gear.status = dto.status;
     gear.isActive =
       gear.status === GearStatus.ACTIVE &&
@@ -424,6 +549,10 @@ export class GearService {
 
     const gear = await this.gearModel.findById(gearId);
     if (!gear) {
+      throw new NotFoundException('Không tìm thấy thiết bị');
+    }
+
+    if (this.isProductionEnvironment() && gear.isDemo) {
       throw new NotFoundException('Không tìm thấy thiết bị');
     }
 
@@ -478,6 +607,7 @@ export class GearService {
         ownerId,
         status: GearStatus.ACTIVE,
         moderationStatus: GearModerationStatus.APPROVED,
+        ...(this.isProductionEnvironment() ? { isDemo: { $ne: true } } : {}),
       })
       .sort({ createdAt: -1 })
       .limit(20)
@@ -497,6 +627,10 @@ export class GearService {
 
     const gear = await this.gearModel.findById(gearId).lean();
     if (!gear) {
+      throw new NotFoundException('Không tìm thấy thiết bị');
+    }
+
+    if (this.isProductionEnvironment() && gear.isDemo) {
       throw new NotFoundException('Không tìm thấy thiết bị');
     }
 
@@ -521,6 +655,9 @@ export class GearService {
     const [enriched] = await this.enrichGearItems([gear]);
     const availability = await this.availabilityService.getGearAvailability(
       gearId,
+      undefined,
+      viewerId,
+      viewerRole,
     );
 
     const similarRaw = await this.gearModel
@@ -529,6 +666,7 @@ export class GearService {
         categoryCode: gear.categoryCode,
         status: GearStatus.ACTIVE,
         moderationStatus: GearModerationStatus.APPROVED,
+        ...(this.isProductionEnvironment() ? { isDemo: { $ne: true } } : {}),
       })
       .sort({ ratingAvg: -1, createdAt: -1 })
       .limit(4)
@@ -547,11 +685,12 @@ export class GearService {
     const page = Math.max(Number(query.page) || 1, 1);
     const limit = Math.min(Math.max(Number(query.limit) || 12, 1), 48);
 
-    // Public Marketplace strictly shows only ACTIVE + APPROVED gear
+    // Public Marketplace strictly shows only ACTIVE + APPROVED gear (and blocks demo listings in production)
     const andConditions: FilterQuery<GearItemDocument>[] = [
       {
         status: GearStatus.ACTIVE,
         moderationStatus: GearModerationStatus.APPROVED,
+        ...(this.isProductionEnvironment() ? { isDemo: { $ne: true } } : {}),
       },
     ];
 
@@ -638,35 +777,76 @@ export class GearService {
     const filter: FilterQuery<GearItemDocument> =
       andConditions.length === 1 ? andConditions[0] : { $and: andConditions };
 
-    // Date range availability filter [startAt, endAt)
+    // Date range availability filter [startAt, endAt) + shared duration & peak occupancy validation
     let reservedMap: Map<string, number> | null = null;
+    let parsedSearchInterval: {
+      startAt: Date;
+      endAt: Date;
+      rentalDays: number;
+    } | null = null;
+    const requestedQty = Math.max(1, Number(query.quantity) || 1);
+
     if (query.startAt && query.endAt) {
-      const { startAt, endAt } =
-        this.availabilityService.parseAndValidateInterval(
-          query.startAt,
-          query.endAt,
-        );
+      parsedSearchInterval = this.availabilityService.parseAndValidateInterval(
+        query.startAt,
+        query.endAt,
+      );
       reservedMap = await this.availabilityService.getOverlappingReservedMap(
-        startAt,
-        endAt,
+        parsedSearchInterval.startAt,
+        parsedSearchInterval.endAt,
       );
     }
 
     const rawCandidates = await this.gearModel.find(filter).lean();
 
-    // Filter out items that have 0 remaining quantity during [startAt, endAt)
-    const availableCandidates = reservedMap
-      ? rawCandidates.filter((g: any) => {
-          const reserved = reservedMap!.get(String(g._id)) || 0;
-          return (g.totalQuantity || 1) - reserved > 0;
-        })
-      : rawCandidates;
+    // Filter out ineligible listings, duration-rule violations, and insufficient remaining units
+    const availableCandidates =
+      reservedMap && parsedSearchInterval
+        ? rawCandidates.filter((g: any) => {
+            if (!this.availabilityService.isGearEligibleForBooking(g).eligible) {
+              return false;
+            }
+            const dur =
+              this.availabilityService.validateRentalDurationAndNotice(
+                g,
+                parsedSearchInterval!.startAt,
+                parsedSearchInterval!.rentalDays,
+              );
+            if (!dur.valid) return false;
+            const reserved = reservedMap!.get(String(g._id)) || 0;
+            const available = Math.max(
+              0,
+              Math.max(1, Number(g.totalQuantity) || 1) - reserved,
+            );
+            return available >= requestedQty;
+          })
+        : rawCandidates;
 
     // Enrich and compute distanceKm if geo coordinates provided
     let enrichedItems = await this.enrichGearItems(
       availableCandidates,
       hasGeoQuery ? [Number(query.lng), Number(query.lat)] : undefined,
     );
+
+    if (reservedMap && parsedSearchInterval) {
+      enrichedItems = enrichedItems.map((item) => {
+        const reserved = reservedMap!.get(String(item.id)) || 0;
+        const availableQuantity = Math.max(
+          0,
+          Math.max(1, Number(item.totalQuantity) || 1) - reserved,
+        );
+        const quote = this.availabilityService.calculateRentalQuote(
+          item,
+          parsedSearchInterval!.rentalDays,
+          requestedQty,
+        );
+        return {
+          ...item,
+          availableQuantity,
+          estimatedQuoteVnd: quote,
+        };
+      });
+    }
 
     // Sort results
     const sortBy = query.sortBy || 'newest';

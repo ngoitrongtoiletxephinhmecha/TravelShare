@@ -109,7 +109,7 @@ describe('ChecklistsService & Gear Matching Suite (Phase 7)', () => {
           !existing ||
           (filter.checklistVersion !== undefined &&
             Number(existing.checklistVersion || 1) !==
-              Number(filter.checklistVersion))
+            Number(filter.checklistVersion))
         ) {
           return makeChainable(null);
         }
@@ -136,10 +136,41 @@ describe('ChecklistsService & Gear Matching Suite (Phase 7)', () => {
     };
 
     const mockGearItemModel: any = {
-      find: jest.fn().mockImplementation((filter: any) => {
+      find: jest.fn().mockImplementation((filter: any = {}) => {
         const list = Array.from(gearItemsStore.values()).filter((g) => {
-          if (filter.categoryCode && g.categoryCode !== filter.categoryCode) {
+          if (filter.categoryCode) {
+            if (filter.categoryCode.$in) {
+              if (!filter.categoryCode.$in.includes(g.categoryCode)) {
+                return false;
+              }
+            } else if (g.categoryCode !== filter.categoryCode) {
+              return false;
+            }
+          }
+          if (
+            filter.ownerId?.$ne &&
+            String(g.ownerId) === String(filter.ownerId.$ne)
+          ) {
             return false;
+          }
+          if (filter.sharingType) {
+            if (filter.sharingType.$in) {
+              if (!filter.sharingType.$in.includes(g.sharingType)) return false;
+            } else if (g.sharingType !== filter.sharingType) {
+              return false;
+            }
+          }
+          if (filter.$or && Array.isArray(filter.$or)) {
+            const matchedOr = filter.$or.some((cond: any) => {
+              if (cond.sharingType && g.sharingType === cond.sharingType) {
+                return true;
+              }
+              if (cond.pricePerDay !== undefined && g.pricePerDay === cond.pricePerDay) {
+                return true;
+              }
+              return false;
+            });
+            if (!matchedOr) return false;
           }
           if (filter.status && g.status !== filter.status) return false;
           if (
@@ -161,11 +192,18 @@ describe('ChecklistsService & Gear Matching Suite (Phase 7)', () => {
     };
 
     const mockAvailabilityModel: any = {
-      find: jest.fn().mockImplementation((filter: any) => {
+      find: jest.fn().mockImplementation((filter: any = {}) => {
         const startLt = filter.startAt?.$lt;
         const endGt = filter.endAt?.$gt;
         const list = availabilityStore.filter((a) => {
-          if (String(a.gearId) !== String(filter.gearId)) return false;
+          if (filter.gearId) {
+            if (filter.gearId.$in) {
+              const allowed = filter.gearId.$in.map((id: any) => String(id));
+              if (!allowed.includes(String(a.gearId))) return false;
+            } else if (String(a.gearId) !== String(filter.gearId)) {
+              return false;
+            }
+          }
           if (startLt && !(new Date(a.startAt) < new Date(startLt))) {
             return false;
           }
@@ -179,12 +217,23 @@ describe('ChecklistsService & Gear Matching Suite (Phase 7)', () => {
     };
 
     const mockBookingModel: any = {
-      find: jest.fn().mockImplementation((filter: any) => {
+      find: jest.fn().mockImplementation((filter: any = {}) => {
         const startLt = filter.startAt?.$lt;
         const endGt = filter.endAt?.$gt;
         const allowedStatuses: string[] = filter.status?.$in || [];
         const list = bookingsStore.filter((b) => {
-          if (String(b.gearId) !== String(filter.gearId)) return false;
+          if (filter.gearId) {
+            if (filter.gearId.$in) {
+              const allowed = filter.gearId.$in.map((id: any) => String(id));
+              if (!allowed.includes(String(b.gearId))) return false;
+            } else if (String(b.gearId) !== String(filter.gearId)) {
+              return false;
+            }
+          }
+          if (filter._id?.$in) {
+            const allowedIds = filter._id.$in.map((id: any) => String(id));
+            if (!allowedIds.includes(String(b._id))) return false;
+          }
           if (
             allowedStatuses.length > 0 &&
             !allowedStatuses.includes(b.status)
@@ -210,8 +259,9 @@ describe('ChecklistsService & Gear Matching Suite (Phase 7)', () => {
     };
 
     availabilityService = new AvailabilityService(
-      mockGearItemModel,
       mockAvailabilityModel,
+      mockGearItemModel,
+      mockBookingModel,
     );
 
     checklistsService = new ChecklistsService(
@@ -815,5 +865,530 @@ describe('ChecklistsService & Gear Matching Suite (Phase 7)', () => {
     expect(
       latest.items.find((i: any) => i.categoryCode === 'CAMPING_CHAIR')?.quantityOwned,
     ).toBe(2);
+  });
+
+  // =========================================================================
+  // 8. ALL 8 OFFICIAL ACTIVITY TYPES, COASTAL CAMPING & SELF-PREPARE MATCHING
+  // =========================================================================
+  it('generates distinct checklists for all 8 ActivityTypes without falling back to TREKKING, and supports coastal CAMPING', async () => {
+    const scenarios: Array<{
+      activity: ActivityType;
+      environment?: string;
+      isOvernight?: boolean;
+      expectedCodes: string[];
+      forbiddenCodes?: string[];
+    }> = [
+        {
+          activity: ActivityType.BEACH,
+          environment: 'COASTAL',
+          isOvernight: false,
+          expectedCodes: ['SWIMWEAR', 'BEACH_TOWEL', 'BEACH_SANDALS', 'DRY_BAG', 'CAMERA', 'CAMPING_CHAIR'],
+          forbiddenCodes: ['TREKKING_POLES', 'TENT'],
+        },
+        {
+          activity: ActivityType.SIGHTSEEING,
+          environment: 'URBAN',
+          isOvernight: false,
+          expectedCodes: ['WALKING_SHOES', 'CAMERA', 'POWER_BANK', 'SUN_PROTECTION'],
+          forbiddenCodes: ['TREKKING_POLES', 'TENT'],
+        },
+        {
+          activity: ActivityType.MOTORBIKE_TOUR,
+          isOvernight: false,
+          expectedCodes: ['HELMET', 'RIDING_GLOVES_ARMOR', 'BUNGEE_CORDS', 'TIRE_REPAIR_KIT', 'DRY_BAG'],
+          forbiddenCodes: ['TREKKING_POLES', 'TENT'],
+        },
+        {
+          activity: ActivityType.BACKPACKING,
+          isOvernight: true,
+          expectedCodes: ['BACKPACK', 'TRAVEL_LOCK_POUCH', 'QUICK_DRY_CLOTHES', 'POWER_BANK', 'CAMERA'],
+          forbiddenCodes: ['TREKKING_POLES'],
+        },
+        {
+          activity: ActivityType.MOUNTAINEERING,
+          environment: 'MOUNTAIN',
+          isOvernight: true,
+          expectedCodes: ['TREKKING_POLES', 'THERMAL_LAYER', 'CLIMBING_GLOVES', 'TENT', 'SLEEPING_BAG'],
+        },
+        {
+          activity: ActivityType.TREKKING,
+          environment: 'FOREST',
+          isOvernight: false,
+          expectedCodes: ['BACKPACK', 'TREKKING_POLES', 'TREKKING_SHOES', 'HEADLAMP'],
+        },
+        {
+          activity: ActivityType.CAMPING,
+          environment: 'COASTAL',
+          isOvernight: true,
+          expectedCodes: ['TENT', 'SLEEPING_BAG', 'CAMPING_STOVE', 'CAMPING_CHAIR', 'TARP', 'SUN_PROTECTION'],
+          forbiddenCodes: ['TREKKING_POLES'],
+        },
+        {
+          activity: ActivityType.OTHER,
+          isOvernight: false,
+          expectedCodes: ['BACKPACK', 'FIRST_AID_KIT', 'POWER_BANK', 'RAIN_JACKET'],
+          forbiddenCodes: ['TREKKING_POLES', 'TENT'],
+        },
+      ];
+
+    for (const s of scenarios) {
+      const planId = new Types.ObjectId();
+      travelPlansStore.set(String(planId), {
+        _id: planId,
+        userId: new Types.ObjectId(user1Id),
+        destination: 'Điểm đến thử nghiệm',
+        activity: s.activity,
+        environment: s.environment || null,
+        isOvernight: Boolean(s.isOvernight),
+        durationDays: s.isOvernight ? 2 : 1,
+        travelers: 4,
+        ownedGearCodes: [],
+        planVersion: 1,
+      });
+
+      const cl = await checklistsService.generateOrGetChecklistForPlan(user1Id, String(planId));
+      const codes = cl.items.map((i: any) => i.categoryCode);
+      for (const expected of s.expectedCodes) {
+        expect(codes).toContain(expected);
+      }
+      for (const forbidden of s.forbiddenCodes || []) {
+        expect(codes).not.toContain(forbidden);
+      }
+    }
+  });
+
+  it('preserves manual edits and custom items when switching BEACH -> coastal CAMPING', async () => {
+    const planId = new Types.ObjectId();
+    travelPlansStore.set(String(planId), {
+      _id: planId,
+      userId: new Types.ObjectId(user1Id),
+      destination: 'Cát Bà',
+      activity: ActivityType.BEACH,
+      environment: 'COASTAL',
+      isOvernight: false,
+      durationDays: 2,
+      travelers: 4,
+      ownedGearCodes: [],
+      planVersion: 1,
+    });
+
+    const v1 = await checklistsService.generateOrGetChecklistForPlan(user1Id, String(planId));
+    const chair = v1.items.find((i: any) => i.categoryCode === 'CAMPING_CHAIR');
+    expect(chair).toBeDefined();
+
+    // User manually updates owned chair count and adds a custom item
+    await checklistsService.updateChecklistItem(user1Id, v1.id, chair.itemId, {
+      quantityOwned: 2,
+      quantityRequired: 5,
+    });
+    await checklistsService.addChecklistItem(user1Id, v1.id, {
+      categoryCode: 'COOLER_BOX',
+      name: 'Thùng giữ nhiệt',
+      quantityRequired: 1,
+      quantityOwned: 1,
+    });
+
+    // Switch plan to coastal overnight CAMPING
+    travelPlansStore.set(String(planId), {
+      ...travelPlansStore.get(String(planId)),
+      activity: ActivityType.CAMPING,
+      environment: 'COASTAL',
+      isOvernight: true,
+      planVersion: 2,
+    });
+
+    const v2 = await checklistsService.generateOrGetChecklistForPlan(user1Id, String(planId));
+    expect(v2.checklistVersion).toBeGreaterThan(v1.checklistVersion);
+    const updatedChair = v2.items.find((i: any) => i.categoryCode === 'CAMPING_CHAIR');
+    expect(updatedChair.quantityOwned).toBe(2);
+    expect(updatedChair.quantityRequired).toBe(5);
+    expect(updatedChair.userEditedOwned).toBe(true);
+    expect(updatedChair.userEditedRequired).toBe(true);
+    expect(v2.items.some((i: any) => i.categoryCode === 'TARP')).toBe(true);
+    expect(v2.items.some((i: any) => i.categoryCode === 'TENT')).toBe(true);
+    expect(v2.items.some((i: any) => i.categoryCode === 'COOLER_BOX' && i.isCustomItem)).toBe(true);
+  });
+
+  it('matches missing BEACH gear while excluding self-prepare items (SWIMWEAR) and sufficient items (DRY_BAG)', async () => {
+    const planId = new Types.ObjectId();
+    travelPlansStore.set(String(planId), {
+      _id: planId,
+      userId: new Types.ObjectId(user1Id),
+      destination: 'Cát Bà',
+      activity: ActivityType.BEACH,
+      environment: 'COASTAL',
+      isOvernight: false,
+      durationDays: 2,
+      travelers: 2,
+      ownedGearCodes: ['DRY_BAG'],
+      ownedGearQuantities: { DRY_BAG: 2 },
+      planVersion: 1,
+    });
+
+    const cl = await checklistsService.generateOrGetChecklistForPlan(user1Id, String(planId));
+    expect(cl.items.find((i: any) => i.categoryCode === 'DRY_BAG')?.quantityMissing).toBe(0);
+    expect(cl.items.find((i: any) => i.categoryCode === 'SWIMWEAR')?.canRent).toBe(false);
+
+    // Add an approved CAMERA listing in Hải Phòng; leave CAMPING_CHAIR with 0 listings
+    const cameraId = new Types.ObjectId();
+    gearItemsStore.set(String(cameraId), {
+      _id: cameraId,
+      ownerId: new Types.ObjectId(ownerId),
+      categoryCode: 'CAMERA',
+      title: '[DEMO] GoPro Hero 12 Chống Nước',
+      condition: GearCondition.LIKE_NEW,
+      attributes: {},
+      totalQuantity: 1,
+      sharingType: GearListingType.RENT,
+      pricePerDay: 180000,
+      depositAmount: 2000000,
+      city: 'Hải Phòng',
+      district: 'Cát Hải',
+      status: GearStatus.ACTIVE,
+      moderationStatus: GearModerationStatus.APPROVED,
+      isActive: true,
+      ratingAvg: 4.9,
+    });
+
+    const res = await checklistsService.matchMissingGear(user1Id, cl.id, {
+      startAt: '2026-12-10',
+      endAt: '2026-12-12',
+      pickupArea: 'Hải Phòng',
+    });
+
+    const matchedCamera = res.itemMatches.find((m: any) => m.categoryCode === 'CAMERA');
+    const matchedChair = res.itemMatches.find((m: any) => m.categoryCode === 'CAMPING_CHAIR');
+    expect(matchedCamera).toBeDefined();
+    expect(matchedCamera.candidates.length).toBe(1);
+    expect(matchedCamera.candidates[0].title).toContain('GoPro Hero 12');
+
+    expect(matchedChair).toBeDefined();
+    expect(matchedChair.candidates.length).toBe(0);
+
+    // Sufficient item excluded from itemMatches
+    expect(res.itemMatches.some((m: any) => m.categoryCode === 'DRY_BAG')).toBe(false);
+    // Self-prepare items go to nonRentableItems, not itemMatches
+    expect(res.itemMatches.some((m: any) => m.categoryCode === 'SWIMWEAR')).toBe(false);
+    expect(res.nonRentableItems.some((n: any) => n.categoryCode === 'SWIMWEAR')).toBe(true);
+  });
+
+  it('Phase 9B matching: uses sweep-line peak concurrency (morning+afternoon -> 1 left, ownerBlocked+disputed -> 0) and enforces min/max rental days', async () => {
+    const planId = new Types.ObjectId();
+    travelPlansStore.set(String(planId), {
+      _id: planId,
+      userId: new Types.ObjectId(user1Id),
+      destination: 'Lảo Thẩn',
+      activity: ActivityType.TREKKING,
+      isOvernight: true,
+      durationDays: 2,
+      travelers: 1,
+      ownedGearCodes: ['BACKPACK', 'TREKKING_POLES', 'TREKKING_SHOES', 'HEADLAMP', 'SLEEPING_BAG'],
+      ownedGearQuantities: {
+        BACKPACK: 1,
+        TREKKING_POLES: 1,
+        TREKKING_SHOES: 1,
+        HEADLAMP: 1,
+        SLEEPING_BAG: 1,
+      },
+      planVersion: 1,
+    });
+
+    const cl = await checklistsService.generateOrGetChecklistForPlan(user1Id, String(planId));
+
+    const tentId = new Types.ObjectId();
+    gearItemsStore.set(String(tentId), {
+      _id: tentId,
+      ownerId: new Types.ObjectId(ownerId),
+      categoryCode: 'TENT',
+      title: '[9B] Lều 2 chiếc',
+      condition: GearCondition.GOOD,
+      attributes: {},
+      totalQuantity: 2,
+      sharingType: GearListingType.RENT,
+      pricePerDay: 100000,
+      depositAmount: 400000,
+      city: 'Hà Nội',
+      district: 'Đống Đa',
+      availabilitySettings: { minRentalDays: 1, maxRentalDays: 3, advanceNoticeHours: 0 },
+      status: GearStatus.ACTIVE,
+      moderationStatus: GearModerationStatus.APPROVED,
+      isActive: true,
+      ratingAvg: 4.9,
+    });
+
+    // Morning booking [08:00, 12:00) + Afternoon booking [13:00, 17:00) on 2026-12-06
+    const morningBkId = new Types.ObjectId();
+    const afternoonBkId = new Types.ObjectId();
+    bookingsStore.push(
+      {
+        _id: morningBkId,
+        gearId: tentId,
+        status: BookingStatus.APPROVED,
+        startAt: new Date('2026-12-06T08:00:00+07:00'),
+        endAt: new Date('2026-12-06T12:00:00+07:00'),
+        quantity: 1,
+      },
+      {
+        _id: afternoonBkId,
+        gearId: tentId,
+        status: BookingStatus.IN_USE,
+        startAt: new Date('2026-12-06T13:00:00+07:00'),
+        endAt: new Date('2026-12-06T17:00:00+07:00'),
+        quantity: 1,
+      },
+    );
+
+    // Whole day query [08:00, 18:00) still has 1 unit available!
+    const matchWholeDay = await checklistsService.matchMissingGear(user1Id, cl.id, {
+      startAt: '2026-12-06T08:00:00+07:00',
+      endAt: '2026-12-06T18:00:00+07:00',
+      pickupArea: 'Đống Đa, Hà Nội',
+    });
+    const tentMatch = matchWholeDay.itemMatches.find((m: any) => m.categoryCode === 'TENT');
+    expect(tentMatch.candidates.length).toBe(1);
+    expect(tentMatch.candidates[0].availableQuantity).toBe(1);
+
+    // Exceeding maxRentalDays (5 days > 3) excludes that tent cleanly
+    const matchTooLong = await checklistsService.matchMissingGear(user1Id, cl.id, {
+      startAt: '2026-12-10',
+      endAt: '2026-12-15',
+      pickupArea: 'Đống Đa, Hà Nội',
+    });
+    const tentTooLong = matchTooLong.itemMatches.find((m: any) => m.categoryCode === 'TENT');
+    expect(tentTooLong.candidates.length).toBe(0);
+
+    // Add OWNER_BLOCKED overlapping afternoon DISPUTED/IN_USE -> 2 total occupied at 14:00 -> 0 left!
+    availabilityStore.push({
+      _id: new Types.ObjectId(),
+      gearId: tentId,
+      reason: 'OWNER_BLOCKED',
+      reservedQuantity: 1,
+      startAt: new Date('2026-12-06T14:00:00+07:00'),
+      endAt: new Date('2026-12-06T16:00:00+07:00'),
+    });
+    const matchZero = await checklistsService.matchMissingGear(user1Id, cl.id, {
+      startAt: '2026-12-06T08:00:00+07:00',
+      endAt: '2026-12-06T18:00:00+07:00',
+      pickupArea: 'Đống Đa, Hà Nội',
+    });
+    const tentZero = matchZero.itemMatches.find((m: any) => m.categoryCode === 'TENT');
+    expect(tentZero.candidates.length).toBe(0);
+  });
+
+  // =========================================================================
+  // 10. PHASE 9C — PER-SIZE NON-SUBSTITUTION, BUDGET ALLOCATION, PRIVACY/OWN-GEAR/COORDS & BATCH PERFORMANCE
+  // =========================================================================
+  it('Phase 9C: enforces size 38 cannot substitute size 42, enforces capacity, and splits budget 80k on 50k/day x2 to max 1 unit', async () => {
+    // 1. Footwear per-size ("một đôi 38 và một đôi 42") — 2 pairs of size 38 still only fulfills 1/2!
+    const planId = new Types.ObjectId();
+    travelPlansStore.set(String(planId), {
+      _id: planId,
+      userId: new Types.ObjectId(user1Id),
+      destination: 'Yên Tử',
+      activity: ActivityType.TREKKING,
+      durationDays: 1,
+      travelers: 2,
+      ownedGearCodes: ['BACKPACK', 'TREKKING_POLES', 'HEADLAMP'],
+      ownedGearQuantities: { BACKPACK: 2, TREKKING_POLES: 2, HEADLAMP: 2 },
+      planVersion: 1,
+    });
+
+    const cl = await checklistsService.generateOrGetChecklistForPlan(user1Id, String(planId));
+    const shoeItem = cl.items.find((i: any) => i.categoryCode === 'TREKKING_SHOES');
+
+    // Require 1 pair size 38 AND 1 pair size 42
+    await checklistsService.updateChecklistItem(user1Id, cl.id, shoeItem.itemId, {
+      quantityRequired: 2,
+      requiredAttributes: { sizeBreakdown: { '38': 1, '42': 1 } },
+    });
+
+    // Only size 38 (qty=2) exists in DB -> NO size 42!
+    const shoe38Id = new Types.ObjectId();
+    gearItemsStore.set(String(shoe38Id), {
+      _id: shoe38Id,
+      ownerId: new Types.ObjectId(ownerId),
+      categoryCode: 'TREKKING_SHOES',
+      title: '[9C] Giày Trekking Size 38 (2 đôi)',
+      condition: GearCondition.LIKE_NEW,
+      attributes: { sizeEu: 38, size: '38' },
+      totalQuantity: 2,
+      sharingType: GearListingType.RENT,
+      pricePerDay: 50000,
+      depositAmount: 300000,
+      city: 'Hà Nội',
+      district: 'Đống Đa',
+      status: GearStatus.ACTIVE,
+      moderationStatus: GearModerationStatus.APPROVED,
+      isActive: true,
+      ratingAvg: 4.9,
+    });
+
+    // Listing belonging to current user (user1Id) must NEVER be suggested!
+    const ownShoe42Id = new Types.ObjectId();
+    gearItemsStore.set(String(ownShoe42Id), {
+      _id: ownShoe42Id,
+      ownerId: new Types.ObjectId(user1Id),
+      categoryCode: 'TREKKING_SHOES',
+      title: '[9C] Giày Size 42 của chính người thuê',
+      condition: GearCondition.NEW,
+      attributes: { sizeEu: 42 },
+      totalQuantity: 1,
+      sharingType: GearListingType.RENT,
+      pricePerDay: 50000,
+      depositAmount: 300000,
+      city: 'Hà Nội',
+      district: 'Đống Đa',
+      status: GearStatus.ACTIVE,
+      moderationStatus: GearModerationStatus.APPROVED,
+      isActive: true,
+      ratingAvg: 5.0,
+    });
+
+    const partialSizeRes = await checklistsService.matchMissingGear(user1Id, cl.id, {
+      startAt: '2026-12-10T08:00:00+07:00',
+      endAt: '2026-12-11T08:00:00+07:00',
+      pickupArea: 'Đống Đa, Hà Nội',
+    });
+
+    const matchedShoeGroup = partialSizeRes.itemMatches.find(
+      (m: any) => m.categoryCode === 'TREKKING_SHOES',
+    );
+    expect(matchedShoeGroup.totalFulfillableQuantity).toBe(1);
+    expect(matchedShoeGroup.isFullyFulfillable).toBe(false);
+    expect(matchedShoeGroup.candidates.some((c: any) => c.gearId === String(ownShoe42Id))).toBe(false);
+    expect(matchedShoeGroup.unmatchedReason).toContain('không bù thay thế');
+    expect(partialSizeRes.budgetSummary.isWithinTotalBudget).toBe(false);
+
+    // 2. One listing 50,000đ/day x 2 available with budget 80,000đ for 1 day -> fulfills max 1 unit (50,000đ)
+    const planBudgetId = new Types.ObjectId();
+    travelPlansStore.set(String(planBudgetId), {
+      _id: planBudgetId,
+      userId: new Types.ObjectId(user1Id),
+      destination: 'Ba Vì',
+      activity: ActivityType.TREKKING,
+      durationDays: 1,
+      travelers: 2,
+      ownedGearCodes: ['BACKPACK', 'TREKKING_POLES', 'HEADLAMP'],
+      ownedGearQuantities: { BACKPACK: 2, TREKKING_POLES: 2, HEADLAMP: 2 },
+      planVersion: 1,
+    });
+    const clBudget = await checklistsService.generateOrGetChecklistForPlan(user1Id, String(planBudgetId));
+    const shoeBudgetItem = clBudget.items.find((i: any) => i.categoryCode === 'TREKKING_SHOES');
+    await checklistsService.updateChecklistItem(user1Id, clBudget.id, shoeBudgetItem.itemId, {
+      quantityRequired: 2,
+      requiredAttributes: { size: '38' },
+    });
+
+    const budgetCapRes = await checklistsService.matchMissingGear(user1Id, clBudget.id, {
+      startAt: '2026-12-10T08:00:00+07:00',
+      endAt: '2026-12-11T08:00:00+07:00',
+      pickupArea: 'Đống Đa, Hà Nội',
+      budgetVnd: 80000,
+    });
+    const bGroup = budgetCapRes.itemMatches[0];
+    expect(bGroup.candidates[0].fulfillableQuantity).toBe(1);
+    expect(bGroup.candidates[0].coverageLabel).toBe('Đáp ứng 1/2');
+    expect(bGroup.candidates[0].estimatedRentalTotal).toBe(50000);
+    expect(bGroup.totalFulfillableQuantity).toBe(1);
+    expect(budgetCapRes.budgetSummary.isWithinTotalBudget).toBe(false);
+    expect(budgetCapRes.budgetSummary.minTotalEstimatedCostVnd).toBe(50000);
+  });
+
+  it('Phase 9C: excludes unconfirmed owned gear, excludes missing-coords under radius, hides PAUSED/REJECTED listings, and batches queries on 80+ listings', async () => {
+    const planId = new Types.ObjectId();
+    travelPlansStore.set(String(planId), {
+      _id: planId,
+      userId: new Types.ObjectId(user1Id),
+      destination: 'Tà Xùa',
+      activity: ActivityType.TREKKING,
+      durationDays: 2,
+      travelers: 1,
+      ownedGearCodes: ['BACKPACK'], // unconfirmed count -> must stay in unconfirmedOwnedItems, NOT matched!
+      ownedGearQuantities: { TREKKING_POLES: 1, HEADLAMP: 1 },
+      planVersion: 1,
+    });
+
+    const cl = await checklistsService.generateOrGetChecklistForPlan(user1Id, String(planId));
+
+    // Seed hidden (PAUSED) + missing coordinates + valid geo listing + 80 extra synthetic items
+    gearItemsStore.set(String(new Types.ObjectId()), {
+      _id: new Types.ObjectId(),
+      ownerId: new Types.ObjectId(ownerId),
+      categoryCode: 'TREKKING_SHOES',
+      title: '[9C] Giày PAUSED bị ẩn',
+      condition: GearCondition.GOOD,
+      totalQuantity: 1,
+      sharingType: GearListingType.RENT,
+      pricePerDay: 40000,
+      depositAmount: 200000,
+      city: 'Hà Nội',
+      district: 'Đống Đa',
+      pickupLocation: { type: 'Point', coordinates: [105.827, 21.018] },
+      status: GearStatus.PAUSED,
+      moderationStatus: GearModerationStatus.APPROVED,
+      isActive: false,
+      ratingAvg: 4.5,
+    });
+    const noCoordsId = new Types.ObjectId();
+    gearItemsStore.set(String(noCoordsId), {
+      _id: noCoordsId,
+      ownerId: new Types.ObjectId(ownerId),
+      categoryCode: 'TREKKING_SHOES',
+      title: '[9C] Giày thiếu tọa độ',
+      condition: GearCondition.GOOD,
+      totalQuantity: 1,
+      sharingType: GearListingType.RENT,
+      pricePerDay: 40000,
+      depositAmount: 200000,
+      city: 'Hà Nội',
+      district: 'Đống Đa',
+      status: GearStatus.ACTIVE,
+      moderationStatus: GearModerationStatus.APPROVED,
+      isActive: true,
+      ratingAvg: 4.5,
+    });
+
+    for (let i = 0; i < 80; i++) {
+      const id = new Types.ObjectId();
+      gearItemsStore.set(String(id), {
+        _id: id,
+        ownerId: new Types.ObjectId(ownerId),
+        categoryCode: 'TREKKING_SHOES',
+        title: `[9C] Giày hàng loạt #${i}`,
+        condition: GearCondition.GOOD,
+        totalQuantity: 1,
+        sharingType: GearListingType.RENT,
+        pricePerDay: 50000 + i * 1000,
+        depositAmount: 200000,
+        city: 'Hà Nội',
+        district: 'Đống Đa',
+        pickupLocation: { type: 'Point', coordinates: [105.827, 21.018] },
+        status: GearStatus.ACTIVE,
+        moderationStatus: GearModerationStatus.APPROVED,
+        isActive: true,
+        ratingAvg: 4.7,
+      });
+    }
+
+    const resWithGeo = await checklistsService.matchMissingGear(user1Id, cl.id, {
+      startAt: '2026-12-10',
+      endAt: '2026-12-12',
+      lat: 21.018,
+      lng: 105.827,
+      radiusKm: 5,
+      limitPerItem: 10,
+    });
+
+    // Unconfirmed BACKPACK excluded from itemMatches and placed in unconfirmedOwnedItems -> cannot conclude budget!
+    expect(resWithGeo.itemMatches.some((m: any) => m.categoryCode === 'BACKPACK')).toBe(false);
+    expect(resWithGeo.unconfirmedOwnedItems.some((u: any) => u.categoryCode === 'BACKPACK')).toBe(true);
+    expect(resWithGeo.budgetSummary.hasUnconfirmedItems).toBe(true);
+    expect(resWithGeo.budgetSummary.isWithinTotalBudget).toBe(false);
+
+    const shoeGroup = resWithGeo.itemMatches.find((m: any) => m.categoryCode === 'TREKKING_SHOES');
+    expect(shoeGroup.totalCandidatesCount).toBe(80); // PAUSED and missing-coords both excluded cleanly!
+    expect(shoeGroup.candidates.length).toBe(10); // limitPerItem honored
+    expect(shoeGroup.candidates[0].pricePerDay).toBe(50000); // deterministic cheapest-first tiebreak
+    expect(shoeGroup.candidates.some((c: any) => c.gearId === String(noCoordsId))).toBe(false);
   });
 });

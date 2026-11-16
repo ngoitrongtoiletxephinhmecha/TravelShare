@@ -136,3 +136,58 @@ export class Notification {
 export const NotificationSchema = SchemaFactory.createForClass(Notification);
 NotificationSchema.index({ recipientId: 1, isRead: 1, createdAt: -1 });
 NotificationSchema.index({ recipientId: 1, createdAt: -1 });
+
+export type OutboxEventDocument = OutboxEvent & Document;
+
+@Schema({ collection: 'outbox_events', timestamps: true })
+export class OutboxEvent {
+  @Prop({ required: true, trim: true, index: true })
+  eventType: string;
+
+  @Prop({ required: true, unique: true, trim: true })
+  transitionKey: string;
+
+  @Prop({ type: Types.ObjectId, ref: 'Booking', required: true, index: true })
+  bookingId: Types.ObjectId;
+
+  @Prop({ type: Types.ObjectId, ref: 'GearItem', required: true })
+  gearId: Types.ObjectId;
+
+  @Prop({ type: Types.ObjectId, ref: 'User', required: true })
+  renterId: Types.ObjectId;
+
+  @Prop({ type: Types.ObjectId, ref: 'User', required: true })
+  ownerId: Types.ObjectId;
+
+  @Prop({ required: true })
+  actorId: string;
+
+  @Prop({ required: true, default: Date.now })
+  occurredAt: Date;
+
+  @Prop({ type: Object, default: {} })
+  metadata: Record<string, any>;
+
+  @Prop({
+    required: true,
+    enum: ['PENDING', 'PROCESSED', 'FAILED'],
+    default: 'PENDING',
+    index: true,
+  })
+  status: 'PENDING' | 'PROCESSED' | 'FAILED';
+
+  @Prop({ default: 0, min: 0 })
+  attempts: number;
+
+  @Prop({ default: Date.now, index: true })
+  nextAttemptAt: Date;
+
+  @Prop()
+  processedAt?: Date;
+
+  @Prop()
+  lastError?: string;
+}
+
+export const OutboxEventSchema = SchemaFactory.createForClass(OutboxEvent);
+OutboxEventSchema.index({ status: 1, nextAttemptAt: 1 });
